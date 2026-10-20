@@ -1,0 +1,12 @@
+../../bin/striprtf,sha256=x1yosK6DYXEAuDxTveb_WYvstAna7qjNNsc10okbWm0,189
+striprtf-0.0.33.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+striprtf-0.0.33.dist-info/METADATA,sha256=2lw-u_vFNWDEbuCn86QuUH-8EeKFXDlA9Vu1nSY37cQ,2390
+striprtf-0.0.33.dist-info/RECORD,,
+striprtf-0.0.33.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+striprtf-0.0.33.dist-info/WHEEL,sha256=lCkmxWfQsSc9CfIClYeavTdQeEX2toPqufh9gI35EQA,87
+striprtf-0.0.33.dist-info/entry_points.txt,sha256=CtNro5OC0oftcsJqD42pYfmoV3KQh2ejHTOq4Uhhn3k,52
+striprtf-0.0.33.dist-info/licenses/LICENSE,sha256=Xj0zmSAs0fgBlqOzODa2fV4n32y-3QWcOqb0rp8FQng,1512
+striprtf/__init__.py,sha256=ZygAIkX6Nbjag1czWdQa-yP-GM1mBE_9ss21Xh__JFc,34
+striprtf/_version.py,sha256=AGWXI5DVsNfiiV5VgHNNK08ZPMOHqnJB3xLlEoyC3hg,23
+striprtf/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+striprtf/striprtf.py,sha256=C9Fj5id2MGxHQ2QOG2AtEjb6XrxH2vV16851n-kSRXY,13201

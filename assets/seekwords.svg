@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="觅文 SeekWords 图标">
+  <defs>
+    <linearGradient id="base" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#172951"/><stop offset="1" stop-color="#4774e9"/></linearGradient>
+    <linearGradient id="lens" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#42d4c8"/><stop offset="1" stop-color="#79ebdf"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="150%" height="150%"><feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#0b1a40" flood-opacity=".26"/></filter>
+  </defs>
+  <rect x="12" y="12" width="488" height="488" rx="112" fill="url(#base)"/>
+  <path d="M107 92h208l91 91v201c0 22-18 40-40 40H107c-22 0-40-18-40-40V132c0-22 18-40 40-40z" fill="#f8fbff" filter="url(#shadow)"/>
+  <path d="M315 92v68c0 13 10 23 23 23h68" fill="#dce9ff"/>
+  <path d="M119 188h151M119 231h139M119 274h92M119 317h91" stroke="#a9bddb" stroke-width="19" stroke-linecap="round"/>
+  <circle cx="315" cy="307" r="83" fill="#e7fffc" stroke="url(#lens)" stroke-width="25"/>
+  <path d="M371 363l64 64" stroke="#45d3c9" stroke-width="37" stroke-linecap="round"/>
+  <path d="M282 308l22 22 43-48" fill="none" stroke="#1e6e89" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
