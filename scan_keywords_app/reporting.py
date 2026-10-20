@@ -47,6 +47,7 @@ def _write_html(path, hits, metadata):
     status = "已手动停止，报告仅包含部分结果" if limited else "扫描结束"
     if error_count:
         status += f" · {error_count} 项读取或访问错误"
+    status += " · " + metadata.get("report_scope", "全部结果")
     roots = metadata.get("roots", []) or []
     words = metadata.get("keywords", []) or []
     excludes = metadata.get("excludes", []) or []
@@ -156,6 +157,7 @@ def export_report(path, hits, metadata):
             stream.write("觅文 SeekWords · 文件关键词扫描报告\n" + "="*42 + "\n")
             stream.write(f"开始：{metadata.get('started', '—')}\n结束：{metadata.get('finished', '—')}\n")
             stream.write("状态：" + ("已停止，仅部分结果" if metadata.get("cancelled") else "扫描结束") + "\n")
+            stream.write("报告范围：" + metadata.get("report_scope", "全部结果") + "\n")
             stream.write("概览：" + "  ·  ".join(f"{k} {v}" for k, v in summary.items()) + "\n")
             stream.write("扫描范围：\n" + "\n".join("  " + str(root) for root in metadata.get("roots", [])) + "\n")
             stream.write("关键词：" + "、".join(metadata.get("keywords", [])) + "\n\n")

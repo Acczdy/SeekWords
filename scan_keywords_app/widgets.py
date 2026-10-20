@@ -1,6 +1,6 @@
 """Consistent selectors and accessible literal-match previews for Tk."""
 import tkinter as tk
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 
 from .matching import match_ranges
 
@@ -33,6 +33,12 @@ class Choice(ttk.Frame):
         self.button.state(["!disabled"] if value else ["disabled"])
         if not value:
             self.close()
+
+    def set_values(self, values):
+        self.close()
+        self.values = tuple(values)
+        if self.variable.get() not in self.values and self.values:
+            self.variable.set(self.values[0])
 
     def open(self):
         if not self.enabled:
@@ -73,7 +79,10 @@ class Choice(ttk.Frame):
         window.bind("<FocusOut>", lambda _: window.after_idle(self.close_if_unfocused))
         window.bind("<Button-1>", lambda event: self.close() if event.widget is window else None)
         window.update_idletasks()
-        width = max(self.winfo_width(), round(190 * max(1, self.winfo_fpixels("1i") / 96)))
+        scale = max(1, self.winfo_fpixels("1i") / 96)
+        text_width = max((tkfont.nametofont("TkDefaultFont").measure(value) for value in self.values), default=0)
+        width = min(self.winfo_screenwidth() - 16,
+                    max(self.winfo_width(), round(190 * scale), text_width + round(46 * scale)))
         height = window.winfo_reqheight()
         x = min(self.winfo_rootx(), max(0, self.winfo_screenwidth() - width - 8))
         y = self.winfo_rooty() + self.winfo_height() + 4
@@ -100,6 +109,71 @@ class Choice(ttk.Frame):
                 popup.destroy()
             except tk.TclError:
                 pass
+
+
+class ResultSplit(ttk.Frame):
+    """A compact, accessible divider between results and match preview."""
+
+    def __init__(self, parent, ratio=.55, on_ratio_change=None):
+        super().__init__(parent, style="Card.TFrame")
+        self.ratio = ratio
+        self.on_ratio_change = on_ratio_change
+        self.preview_visible = True
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=round(ratio * 100))
+        self.rowconfigure(2, weight=round((1 - ratio) * 100))
+        self.grip = tk.Canvas(self, height=16, background="#ffffff", borderwidth=0,
+                              highlightthickness=0, cursor="sb_v_double_arrow")
+        self.grip.grid(row=1, column=0, sticky="ew")
+        self.grip.bind("<Configure>", self._draw)
+        self.grip.bind("<ButtonPress-1>", self._drag)
+        self.grip.bind("<B1-Motion>", self._drag)
+
+    def add_top(self, widget):
+        widget.grid(row=0, column=0, sticky="nsew")
+
+    def add_bottom(self, widget):
+        self.bottom = widget
+        widget.grid(row=2, column=0, sticky="nsew")
+
+    def set_preview_visible(self, visible):
+        self.preview_visible = visible
+        if visible:
+            self.grip.grid()
+            self.bottom.grid()
+            self.set_ratio(self.ratio)
+        else:
+            self.grip.grid_remove()
+            self.bottom.grid_remove()
+            self.rowconfigure(0, weight=1)
+            self.rowconfigure(2, weight=0)
+
+    def set_ratio(self, ratio):
+        self.ratio = max(.2, min(.8, ratio))
+        if self.preview_visible:
+            self.rowconfigure(0, weight=round(self.ratio * 100))
+            self.rowconfigure(2, weight=round((1 - self.ratio) * 100))
+        if self.on_ratio_change:
+            self.on_ratio_change(self.ratio)
+
+    def _drag(self, event):
+        height = self.winfo_height() - self.grip.winfo_height()
+        if height > 100:
+            y = event.y_root - self.winfo_rooty()
+            self.set_ratio(y / height)
+
+    def _draw(self, event):
+        canvas = self.grip
+        canvas.delete("all")
+        mid = event.height / 2
+        canvas.create_line(0, mid, event.width, mid, fill="#e7edf6")
+        left = event.width / 2 - 30
+        canvas.create_rectangle(left, 2, left + 60, event.height - 2,
+                                fill="#f5f8ff", outline="#cbd8ed")
+        for offset in (-9, 0, 9):
+            x = event.width / 2 + offset
+            canvas.create_oval(x - 1.5, mid - 1.5, x + 1.5, mid + 1.5,
+                               fill="#6382ba", outline="")
 
 
 class Toggle(ttk.Button):

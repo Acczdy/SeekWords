@@ -18,7 +18,7 @@ from . import APP_NAME, VERSION
 from .display import configure_fonts, create_root
 from .file_filters import FILE_CATEGORIES, matches_file_filter
 from .content import CONTENT_TYPES, SCAN_MODES
-from .widgets import Choice, Toggle, MatchPreview, ActionMenu
+from .widgets import Choice, Toggle, MatchPreview, ActionMenu, ResultSplit
 from .permissions import is_windows_admin, request_elevation
 from .system_files import describe_failure, is_user_cancelled
 from .core import (FileActions, Scanner, data_dir, default_excludes,
@@ -232,8 +232,6 @@ class App:
         ttk.Label(title, text=f"按文件名或内容查找  /  v{VERSION}", style="Subtitle.TLabel").pack(anchor="w", pady=(s(4), 0))
         controls = ttk.Frame(header)
         controls.grid(row=0, column=1, sticky="e")
-        self.sidebar_button = ttk.Button(controls, text="折叠侧边栏", width=12, command=self.toggle_sidebar)
-        self.sidebar_button.pack(side="left", padx=(0, s(12)))
         self.start_button = ttk.Button(controls, text="开始扫描", width=10, style="Primary.TButton", command=self.start_scan)
         self.start_button.pack(side="left", padx=(0, s(6)))
         self.pause_button = ttk.Button(controls, text="暂停", width=6, command=self.pause, state="disabled")
@@ -256,7 +254,21 @@ class App:
         self.sidebar.grid_propagate(False)
         self.sidebar.columnconfigure(0, weight=1)
         self.sidebar.rowconfigure(2, weight=1)
-        ttk.Label(self.sidebar, text="扫描设置", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(s(2), s(14)))
+        sidebar_heading = ttk.Frame(self.sidebar, style="Card.TFrame")
+        sidebar_heading.grid(row=0, column=0, sticky="ew", pady=(s(2), s(14)))
+        sidebar_heading.columnconfigure(0, weight=1)
+        ttk.Label(sidebar_heading, text="扫描设置", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.sidebar_button = ttk.Button(sidebar_heading, text="◀", width=3, style="Compact.TButton",
+                                         command=self.toggle_sidebar)
+        self.sidebar_button.grid(row=0, column=1)
+        self.sidebar_button.configure(takefocus=True)
+        self.collapsed_sidebar = ttk.Frame(body, style="Card.TFrame", width=s(44), padding=(s(4), s(12)))
+        self.collapsed_sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, s(14)))
+        self.collapsed_sidebar.grid_remove()
+        self.collapsed_sidebar.grid_propagate(False)
+        self.expand_button = ttk.Button(self.collapsed_sidebar, text="▶", width=3, style="Compact.TButton",
+                                        command=self.toggle_sidebar)
+        self.expand_button.pack(anchor="n")
         tab_bar = ttk.Frame(self.sidebar, style="TabBar.TFrame", height=s(36), padding=s(2))
         tab_bar.grid(row=1, column=0, sticky="ew")
         tab_bar.grid_propagate(False)
@@ -342,7 +354,7 @@ class App:
         ttk.Label(heading, textvariable=self.count, style="Muted.TLabel", width=30, anchor="e").grid(row=0, column=1, sticky="e")
         self.preview_button = ttk.Button(heading, text="隐藏预览", style="Compact.TButton", command=self.toggle_preview)
         self.preview_button.grid(row=0, column=2, padx=(s(8), 0))
-        metrics = ttk.Frame(right, style="Card.TFrame", height=s(52))
+        metrics = ttk.Frame(right, style="Card.TFrame", height=s(70))
         metrics.grid(row=1, column=0, sticky="ew", pady=(s(4), s(4)))
         metrics.grid_propagate(False)
         metrics.rowconfigure(0, weight=1)
@@ -362,14 +374,20 @@ class App:
         filters = ttk.Frame(right, style="Card.TFrame")
         filters.grid(row=2, column=0, sticky="ew", pady=(0, s(8)))
         filters.columnconfigure(1, weight=1)
-        ttk.Label(filters, text="筛选", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
+        ttk.Label(filters, text="搜索", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
         self.query = tk.StringVar()
-        ttk.Entry(filters, textvariable=self.query, width=1).grid(row=0, column=1, sticky="ew", padx=(0, s(8)))
+        self.query_entry = ttk.Entry(filters, textvariable=self.query, width=1)
+        self.query_entry.grid(row=0, column=1, sticky="ew", padx=(0, s(8)))
+        for shortcut in ("<Control-f>", "<Command-f>"):
+            self.root.bind(shortcut, self.focus_result_search)
+        self.keyword_filter = tk.StringVar(value="全部关键词")
+        self.keyword_choice = Choice(filters, self.keyword_filter, ("全部关键词",), width=13)
+        self.keyword_choice.grid(row=0, column=2, padx=(0, s(8)))
         self.kind = tk.StringVar(value="全部类型")
         self.kind_choice = Choice(filters, self.kind, ("全部类型", "文件", "目录", "程序"), width=9)
-        self.kind_choice.grid(row=0, column=2)
+        self.kind_choice.grid(row=0, column=3)
         file_filters = ttk.Frame(filters, style="Card.TFrame")
-        file_filters.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(s(8), 0))
+        file_filters.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(s(8), 0))
         file_filters.columnconfigure(3, weight=1)
         ttk.Label(file_filters, text="类别", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
         self.file_category = tk.StringVar(value="全部文件类别")
@@ -380,14 +398,26 @@ class App:
         ttk.Entry(file_filters, textvariable=self.extensions, width=1).grid(row=0, column=3, sticky="ew")
         ttk.Label(file_filters, text="例：doc, docx", style="Muted.TLabel").grid(row=0, column=4, padx=s(8))
         ttk.Button(file_filters, text="重置筛选", style="Compact.TButton", command=self.reset_filters).grid(row=0, column=5)
+        extra_filters = ttk.Frame(filters, style="Card.TFrame")
+        extra_filters.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(s(8), 0))
+        extra_filters.columnconfigure(1, weight=1)
+        ttk.Label(extra_filters, text="来源", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
+        self.source_filter = tk.StringVar(value="全部来源")
+        self.source_choice = Choice(extra_filters, self.source_filter, ("全部来源", "包含内容命中", "仅名称命中"), width=16)
+        self.source_choice.grid(row=0, column=1, sticky="w")
+        self.export_filtered = tk.BooleanVar(value=False)
+        Toggle(extra_filters, text="报告仅含当前筛选", variable=self.export_filtered, width=21).grid(row=0, column=2, sticky="e")
         self.query.trace_add("write", self.schedule_filter)
+        self.keyword_filter.trace_add("write", self.schedule_filter)
         self.kind.trace_add("write", self.schedule_filter)
         self.file_category.trace_add("write", self.schedule_filter)
         self.extensions.trace_add("write", self.schedule_filter)
-        self.results_split = ttk.Panedwindow(right, orient="vertical")
+        self.source_filter.trace_add("write", self.schedule_filter)
+        self.results_split = ResultSplit(right, ratio=self.preview_ratio, on_ratio_change=self.remember_preview_ratio)
         self.results_split.grid(row=3, column=0, sticky="nsew")
         table = ttk.Frame(self.results_split, style="Card.TFrame")
-        self.results_split.add(table, weight=3)
+        self.results_split.add_top(table)
+        table.grid_propagate(False)
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
         columns = ("kind", "path", "keywords", "match_source", "size", "modified")
@@ -402,9 +432,8 @@ class App:
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
         self.preview = MatchPreview(self.results_split, fullscreen=self.view_matches)
-        self.results_split.add(self.preview, weight=2)
-        self.results_split.bind("<Configure>", self.resize_preview)
-        self.results_split.bind("<ButtonRelease-1>", self.remember_preview_ratio)
+        self.results_split.add_bottom(self.preview)
+        self.preview.grid_propagate(False)
         self.tree.bind("<<TreeviewSelect>>", self.selection_changed)
         self.tree.bind("<Double-1>", lambda _e: self.open_folder())
         self.tree.bind("<Button-3>", self.context_menu)
@@ -486,20 +515,12 @@ class App:
         ttk.Button(panel, text="取消", command=dialog.destroy).grid(row=8, column=0, sticky="w")
         dialog.grab_set()
 
-    def resize_preview(self, _event=None):
-        height = self.results_split.winfo_height()
-        if height > 20:
-            self.results_split.sashpos(0, round(height * self.preview_ratio) if self.preview_visible else height)
-
-    def remember_preview_ratio(self, _event=None):
-        if self.preview_visible and self.results_split.winfo_height() > 20:
-            self.preview_ratio = max(.2, min(.8, self.results_split.sashpos(0) / self.results_split.winfo_height()))
+    def remember_preview_ratio(self, ratio):
+        self.preview_ratio = ratio
 
     def toggle_preview(self):
         self.preview_visible = not self.preview_visible
-        self.results_split.pane(self.preview, weight=2 if self.preview_visible else 0)
-        self.resize_preview()
-        self.root.after_idle(self.resize_preview)
+        self.results_split.set_preview_visible(self.preview_visible)
         self.preview_button.configure(text="隐藏预览" if self.preview_visible else "显示预览")
 
     def select_settings_page(self, selected):
@@ -514,11 +535,12 @@ class App:
         self.sidebar_collapsed = not self.sidebar_collapsed
         if self.sidebar_collapsed:
             self.sidebar.grid_remove()
-            self.body.columnconfigure(0, minsize=0)
+            self.collapsed_sidebar.grid()
+            self.body.columnconfigure(0, minsize=round(44 * self.display_scale))
         else:
+            self.collapsed_sidebar.grid_remove()
             self.sidebar.grid()
             self.body.columnconfigure(0, minsize=round(270 * self.display_scale))
-        self.sidebar_button.configure(text="展开侧边栏" if self.sidebar_collapsed else "折叠侧边栏")
 
     def listbox(self, parent):
         s = lambda value: round(value * self.display_scale)
@@ -676,6 +698,7 @@ class App:
         self.cancel_rebuild()
         self.tree.delete(*self.tree.get_children())
         self.results.clear()
+        self.keyword_choice.set_values(("全部关键词", *keywords))
         self.selected_path.set("")
         self.preview.set_hit(None)
         self.next_id = 0
@@ -725,15 +748,28 @@ class App:
 
     def visible(self, hit):
         query = self.query.get().casefold().strip()
+        keyword = self.keyword_filter.get()
+        matched_words = hit.matched_keywords or hit.keywords.split(" | ")
+        source = self.source_filter.get()
         return (self.kind.get() == "全部类型" or hit.kind == self.kind.get()) and matches_file_filter(
             hit.path, hit.kind, self.file_category.get(), self.extensions.get()) and (
+            keyword == "全部关键词" or any(word.casefold() == keyword.casefold() for word in matched_words)) and (
+            source == "全部来源" or source == "包含内容命中" and hit.match_source in ("内容", "名称+内容") or
+            source == "仅名称命中" and hit.match_source not in ("内容", "名称+内容")) and (
             not query or query in (hit.path + " " + hit.keywords + " " + hit.detail).casefold())
 
     def reset_filters(self):
         self.query.set("")
+        self.keyword_filter.set("全部关键词")
         self.kind.set("全部类型")
         self.file_category.set("全部文件类别")
         self.extensions.set("")
+        self.source_filter.set("全部来源")
+
+    def focus_result_search(self, _event=None):
+        self.query_entry.focus_set()
+        self.query_entry.selection_range(0, "end")
+        return "break"
 
     def insert_hit(self, key, hit):
         self.tree.insert("", "end", iid=key, values=(hit.kind, hit.path, hit.keywords,
@@ -742,7 +778,7 @@ class App:
             datetime.fromtimestamp(hit.modified).strftime("%Y-%m-%d %H:%M") if hit.modified else "—"))
 
     def update_count(self):
-        self.count.set(f"显示 {len(self.tree.get_children()):,} / {len(self.results):,} 项 · 已选 {len(self.tree.selection()):,} 项")
+        self.count.set(f"显示 {len(self.tree.get_children())} / {len(self.results)} 项 · 已选 {len(self.tree.selection())} 项")
 
     def selection_changed(self, _event=None):
         self.update_count()
@@ -785,9 +821,9 @@ class App:
             messagebox.showinfo("选择结果", "请先选中需要查看的结果。", parent=self.root)
 
     def update_metrics(self, payload):
-        self.examined_value.set(f"{payload['examined']:,}")
-        self.hits_value.set(f"{payload['hits']:,}")
-        self.errors_value.set(f"{payload['errors']:,}")
+        self.examined_value.set(str(payload["examined"]))
+        self.hits_value.set(str(payload["hits"]))
+        self.errors_value.set(str(payload["errors"]))
         elapsed = max(0, int(payload["elapsed"]))
         hours, remainder = divmod(elapsed, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -1192,15 +1228,18 @@ class App:
         if not self.results and not self.metadata:
             messagebox.showinfo("暂无结果", "请先执行一次扫描。", parent=self.root)
             return
-        path = filedialog.asksaveasfilename(parent=self.root, title="导出全部结果（包括筛选隐藏项）",
+        filtered = self.export_filtered.get()
+        hits = [hit for hit in self.results.values() if self.visible(hit)] if filtered else list(self.results.values())
+        scope = "当前筛选结果" if filtered else "全部结果（包括筛选隐藏项）"
+        path = filedialog.asksaveasfilename(parent=self.root, title=f"导出{scope}",
             initialfile="觅文报告_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".html",
             defaultextension=".html", filetypes=[("可交互网页报告", "*.html"), ("Excel 表格", "*.csv"),
                                                 ("文本报告", "*.txt"), ("结构化数据", "*.json")])
         if path:
             try:
-                export_report(path, list(self.results.values()), {**self.metadata, "actions": self.action_log,
-                    "remaining_results": len(self.results)})
-                self.status.set("报告已保存：" + path)
+                export_report(path, hits, {**self.metadata, "actions": self.action_log,
+                    "remaining_results": len(self.results), "report_scope": scope})
+                self.status.set(f"已导出{scope} {len(hits)} 项：{path}")
             except (OSError, ValueError) as exc:
                 messagebox.showerror("导出失败", str(exc), parent=self.root)
 
