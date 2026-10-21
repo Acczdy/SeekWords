@@ -21,7 +21,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
 from .system_files import delete_path, move_path
-from .content import CONTENT_TYPES, ContentReader, ContentReadError, ContentCancelled, supports_content
+from .content import CONTENT_TYPES, ContentReader, ContentReadError, ContentCancelled, looks_like_text, supports_content
+from .matching import MatchCollector
+from .ocr import IMAGE_SUFFIXES
+from .registry_sources import classify_registry_path, iter_registry
+from .extra_sources import trash_metadata, windows_trash_metadata
 
 DEFAULT_KEYWORDS = []
 
@@ -113,6 +117,7 @@ class Hit:
     matches_limited: bool = False
     content_error: str = ""
     matched_keywords: list = field(default_factory=list)
+    origin: str = "普通文件"
 
 
 def fingerprint(info):
@@ -125,12 +130,18 @@ def is_link(info):
 
 class Scanner:
     def __init__(self, roots, keywords, events, excludes=(), programs=True, *, scan_mode="name",
-                 content_types=None, max_content_mb=50, content_timeout=30, error_log=None):
-        self.roots = list(dict.fromkeys(canonical(p) for p in roots))
+                 content_types=None, max_content_mb=50, content_timeout=30, error_log=None,
+                 extra_roots=(), registry=False, ocr_engine=None, ocr_language=""):
+        self.extra_roots = sorted(((canonical(path), label) for path, label in extra_roots),
+                                  key=lambda item: len(item[0]), reverse=True)
+        self.roots = compact_paths([*(canonical(p) for p in roots), *(path for path, _ in self.extra_roots)])
         self.keywords = normalize_keywords(keywords)
         self.events = events
         self.excludes = [canonical(p) for p in excludes] + [canonical(data_dir())]
         self.programs = programs
+        self.registry = bool(registry and os.name == "nt")
+        self.ocr_engine = ocr_engine
+        self.ocr_language = ocr_language
         if scan_mode not in ("name", "content", "both"):
             raise ValueError("未知扫描模式")
         self.scan_mode = scan_mode
@@ -139,6 +150,8 @@ class Scanner:
         self.content_reader = ContentReader(content_timeout)
         self.content_read = self.content_skipped = 0
         self.files_examined = self.content_unsupported = self.excluded_entries = self.links_skipped = 0
+        self.registry_keys = self.registry_values = self.registry_unreadable = 0
+        self.ocr_examined = 0
         self.error_log_path = Path(error_log) if error_log else None
         self.error_stream = None
         self.stop = threading.Event()
@@ -209,7 +222,9 @@ class Scanner:
                 permission_errors=self.permission_errors, elapsed=now-self.started,
                 content_read=self.content_read, content_skipped=self.content_skipped)))
             self.events.put(("coverage", dict(files=self.files_examined, unsupported=self.content_unsupported,
-                excluded=self.excluded_entries, links=self.links_skipped)))
+                excluded=self.excluded_entries, links=self.links_skipped, registry_keys=self.registry_keys,
+                registry_values=self.registry_values, registry_unreadable=self.registry_unreadable,
+                ocr_examined=self.ocr_examined)))
             self.last = now
 
     def run(self):
@@ -240,6 +255,10 @@ class Scanner:
                             continue
                         visited.add(identity)
                         self.inspect(current, info)
+                        if stat.S_ISREG(info.st_mode):
+                            self.examined += 1
+                            self.progress()
+                            continue
                         self.directories += 1
                         with os.scandir(current) as entries:
                             for entry in entries:
@@ -274,6 +293,8 @@ class Scanner:
                 self.current = "检查已安装程序"
                 self.progress(True)
                 self.scan_programs()
+            if self.registry and self.checkpoint():
+                self.scan_registry()
         except ContentCancelled:
             pass
         except Exception as exc:
@@ -296,18 +317,38 @@ class Scanner:
             return
         if regular:
             self.files_examined += 1
-        name_words = [k for k in self.keywords if k.casefold() in Path(path).name.casefold()] if self.scan_mode != "content" else []
+        origin = next((label for root, label in self.extra_roots if beneath(path, root)), "普通文件")
+        trash_info = ((windows_trash_metadata(path) if os.name == "nt" else trash_metadata(path))
+                      if origin == "回收站" else None)
+        display_name = Path(path).name + (" " + Path(trash_info[0]).name if trash_info else "")
+        name_words = [k for k in self.keywords if k.casefold() in display_name.casefold()] if self.scan_mode != "content" else []
         content = dict(matched=[], location="", snippet="")
         content_error = ""
-        if regular and self.scan_mode != "name" and not supports_content(path, self.content_types):
+        supported = regular and supports_content(path, self.content_types)
+        ocr_image = regular and self.ocr_engine and Path(path).suffix.casefold() in IMAGE_SUFFIXES
+        extra = regular and any(beneath(path, root) for root, _label in self.extra_roots)
+        fallback = False
+        if regular and self.scan_mode != "name" and extra and not supported and not ocr_image and (
+                "配置与缓存" in self.content_types or "文本 / 脚本" in self.content_types):
+            try:
+                fallback = looks_like_text(path)
+            except OSError as exc:
+                content_error = str(exc)
+                self.content_skipped += 1
+                self.error(path, exc)
+        if regular and self.scan_mode != "name" and not (supported or fallback or ocr_image):
             self.content_unsupported += 1
-        if regular and self.scan_mode != "name" and supports_content(path, self.content_types):
+        if regular and self.scan_mode != "name" and (supported or fallback or ocr_image):
             self.current = "读取内容：" + str(path)
             self.progress(True)
             try:
+                if ocr_image:
+                    self.ocr_examined += 1
                 if info.st_size > self.max_content_bytes:
                     raise ContentReadError(f"文件超过 {self.max_content_bytes // 1024**2} MB 内容扫描上限")
-                content = self.content_reader.read(path, self.keywords, self.checkpoint, self.progress)
+                content = self.content_reader.read(path, self.keywords, self.checkpoint, self.progress,
+                                                   force_text=fallback, ocr_engine=self.ocr_engine if ocr_image else None,
+                                                   ocr_language=self.ocr_language if ocr_image else "")
                 if fingerprint(os.lstat(path)) != fingerprint(info):
                     content = dict(matched=[], location="", snippet="")
                     raise ContentReadError("文件在读取时发生变化，请重新扫描")
@@ -321,16 +362,55 @@ class Scanner:
                 self.error(path, exc)
         matched = [k for k in self.keywords if k in name_words or k in content["matched"]]
         if matched:
-            source = "名称+内容" if name_words and content["matched"] else "内容" if content["matched"] else "文件名"
+            source = ("名称+OCR" if name_words else "图片OCR") if ocr_image and content["matched"] else (
+                "名称+内容" if name_words and content["matched"] else "内容" if content["matched"] else "文件名")
             detail = f"命中来源：{source}"
             if content["location"]:
                 detail += f"\n位置：{content['location']}\n内容片段：{content['snippet']}"
             if content_error:
                 detail += "\n内容未完整读取：" + content_error
+            if trash_info:
+                detail += f"\n原路径：{trash_info[0]}\n删除时间：{trash_info[1] or '未知'}"
             self.emit_hit(Hit(str(path), "目录" if directory else "文件", " | ".join(matched),
                 info.st_size if regular else 0, info.st_mtime, fingerprint(info), detail,
                 source, content["location"], content["snippet"], content.get("matches", []),
-                content.get("match_count", 0), content.get("matches_limited", False), content_error, matched))
+                content.get("match_count", 0), content.get("matches_limited", False), content_error, matched, origin))
+
+    def scan_registry(self):
+        for entry in iter_registry(self.checkpoint, self.error):
+            if not self.checkpoint():
+                break
+            self.current = entry.key_path + ("\\" + (entry.name or "(默认)") if entry.kind != "key" else "")
+            self.examined += 1
+            if entry.kind == "key":
+                self.registry_keys += 1
+                location = "注册表键名"
+                content = entry.name
+            else:
+                self.registry_values += 1
+                if entry.kind == "binary":
+                    self.registry_unreadable += 1
+                location = "注册表值名"
+                content = entry.name or "(默认)"
+            collector = MatchCollector(self.keywords)
+            collector.feed(location, content)
+            name_match = collector.result()["matched"]
+            if entry.kind == "value":
+                collector.feed("注册表值数据", entry.text)
+            result = collector.result()
+            matched = result["matched"]
+            if matched:
+                data_match = bool(set(matched) - set(name_match)) or (
+                    entry.kind == "value" and any(word.casefold() in entry.text.casefold() for word in matched))
+                source = ("注册表名称+数据" if name_match and data_match else
+                          "注册表数据" if data_match else "注册表路径" if entry.kind == "key" else "注册表值名")
+                path = entry.key_path if entry.kind == "key" else self.current
+                self.emit_hit(Hit(path, "注册表", " | ".join(matched), detail=f"只读注册表结果 · {source}",
+                                  match_source=source, location=result["location"], snippet=result["snippet"],
+                                  matches=result["matches"], match_count=result["match_count"],
+                                  matches_limited=result["matches_limited"], matched_keywords=matched,
+                                  origin=classify_registry_path(path)))
+            self.progress()
 
     def scan_programs(self):
         if os.name == "nt":
@@ -358,7 +438,8 @@ class Scanner:
                                             identity = (name, tuple(details))
                                             if identity not in seen:
                                                 seen.add(identity)
-                                                self.emit_hit(Hit(name, "程序", matched, detail=" | ".join(details)))
+                                                self.emit_hit(Hit(name, "程序", matched, detail=" | ".join(details),
+                                                                  origin="已安装程序"))
                                 except OSError:
                                     continue
                     except OSError:
@@ -377,7 +458,7 @@ class Scanner:
                                 matched = self.match(name)
                                 if matched:
                                     self.emit_hit(Hit(str(Path(current)/name), "程序", matched,
-                                                      detail="macOS 应用；仅展示"))
+                                                      detail="macOS 应用；仅展示", origin="已安装程序"))
                 except OSError as exc:
                     self.error(str(folder), exc)
         else:
@@ -410,7 +491,8 @@ class Scanner:
                                 return
                             matched = self.match(name)
                             if matched:
-                                self.emit_hit(Hit(name.strip(), "程序", matched, detail=command[0]))
+                                self.emit_hit(Hit(name.strip(), "程序", matched, detail=command[0],
+                                                  origin="已安装程序"))
                 except OSError as exc:
                     self.error(command[0], exc)
 

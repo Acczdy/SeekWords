@@ -48,6 +48,14 @@ def main():
                 target = Path(__file__).resolve().parents[1] / "assets" / "screenshot.png"
                 screenshot.save(target, optimize=True)
                 print(target)
+                app.select_settings_page(0)
+                root.update()
+                root.update_idletasks()
+                sources = ImageGrab.grab(bbox=(x, y, x + root.winfo_width(), y + root.winfo_height()),
+                                         xdisplay=root.tk.call("winfo", "screen", root._w))
+                source_target = target.with_name("screenshot-sources.png")
+                sources.save(source_target, optimize=True)
+                print(source_target)
             finally:
                 root.destroy()
 

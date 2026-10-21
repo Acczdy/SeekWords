@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 import multiprocessing as mp
+import plistlib
+import sqlite3
 import sys
 import zipfile
 from unittest.mock import patch
@@ -123,17 +125,36 @@ def main():
                 jobs.append(path)
             (Path(temp) / "document.rtf").write_text(r"{\rtf1\ansi ORBIT}", encoding="ascii")
             (Path(temp) / "notes.txt").write_text("ORBIT", encoding="utf-8")
-            jobs += [Path(temp) / name for name in ("document.rtf", "notes.txt")]
+            (Path(temp) / "settings.plist").write_bytes(plistlib.dumps({"recent": "ORBIT"}, fmt=plistlib.FMT_BINARY))
+            database = Path(temp) / "cache.sqlite"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE recent (name TEXT)")
+                connection.execute("INSERT INTO recent VALUES ('ORBIT')")
+                connection.commit()
+            finally:
+                connection.close()
+            jobs += [Path(temp) / name for name in ("document.rtf", "notes.txt", "settings.plist", "cache.sqlite")]
+            from PIL import Image, ImageDraw, ImageFont
+            image = Image.new("RGB", (900, 170), "white")
+            ImageDraw.Draw(image).text((20, 40), "项目 ORBIT 已完成测试", fill="black",
+                                       font=ImageFont.truetype(str(Path(os.environ["SystemRoot"]) / "Fonts/msyh.ttc"), 46))
+            picture = Path(temp) / "capture.png"
+            image.save(picture)
             with patch.object(sys, "frozen", True, create=True), patch.object(spawn, "get_preparation_data", side_effect=preparation):
                 for path in jobs:
                     result = reader.read(path, ["ORBIT"], lambda: True, lambda: None)
                     assert result["matched"] == ["ORBIT"] and not result["error"], (str(path), result)
                     assert result["match_count"] >= 1 and result["matches"], (str(path), result)
                     assert "行" in result["matches"][0]["position"] and "ORBIT" in result["matches"][0]["text"]
+                result = reader.read(picture, ["项目", "ORBIT"], lambda: True, lambda: None,
+                                     ocr_engine="rapidocr", ocr_language="中英混合")
+                assert result["matched"] == ["项目", "ORBIT"] and not result["error"], result
+                assert "像素" in result["location"] and result["matches"], result
     finally:
         reader.close()
         mp.set_executable(previous_executable)
-    print(json.dumps({"frozen_document_worker": True, "formats": ["docx", "pptx", "xlsx", "rtf", "txt"]}))
+    print(json.dumps({"frozen_document_worker": True, "formats": ["docx", "pptx", "xlsx", "rtf", "txt", "plist", "sqlite", "ocr-png"]}))
 
 
 if __name__ == "__main__":

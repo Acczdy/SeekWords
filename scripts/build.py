@@ -22,6 +22,10 @@ def main():
             "--paths", str(VENDOR), "--icon", str(icon),
             "--add-data", f"{VENDOR}{os.pathsep}scan_keywords_app/_vendor",
             "--add-data", f"{ROOT / 'assets'}{os.pathsep}assets",
+            "--add-data", f"{ROOT / 'docs/OCR_COMPONENTS.md'}{os.pathsep}docs",
+            "--add-data", f"{ROOT / 'docs/third_party'}{os.pathsep}docs/third_party",
+            "--collect-data", "rapidocr",
+            "--hidden-import", "rapidocr", "--hidden-import", "onnxruntime",
             "--hidden-import", "olefile", "--hidden-import", "xlrd",
             "--hidden-import", "pypdf", "--hidden-import", "striprtf.striprtf"]
     if system == "Darwin":

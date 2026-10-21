@@ -29,6 +29,7 @@ class GuiFilterTests(unittest.TestCase):
         app.file_category = Variable("全部文件类别")
         app.extensions = Variable("")
         app.source_filter = Variable("全部来源")
+        app.origin_filter = Variable("全部位置")
         return app
 
     def test_keyword_filter_matches_complete_words_case_insensitively(self):
@@ -50,6 +51,14 @@ class GuiFilterTests(unittest.TestCase):
         app.source_filter.set("仅名称命中")
         self.assertFalse(app.visible(content))
         self.assertTrue(app.visible(filename))
+
+    def test_location_filter_distinguishes_cache_and_registry(self):
+        app = self.make_app()
+        app.origin_filter.set("用户缓存")
+        self.assertTrue(app.visible(Hit("/cache/item.txt", "文件", "ORBIT", origin="用户缓存")))
+        self.assertFalse(app.visible(Hit("/home/item.txt", "文件", "ORBIT")))
+        app.origin_filter.set("Windows 注册表")
+        self.assertTrue(app.visible(Hit("HKCU\\Software\\Item", "注册表", "ORBIT", origin="Windows 注册表")))
 
     def test_checked_count_has_no_grouping_punctuation(self):
         app = self.make_app()

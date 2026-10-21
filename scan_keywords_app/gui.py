@@ -18,11 +18,13 @@ from . import APP_NAME, VERSION
 from .display import configure_fonts, create_root
 from .file_filters import FILE_CATEGORIES, matches_file_filter
 from .content import CONTENT_TYPES, SCAN_MODES
+from .extra_sources import discover_extra_roots
+from .ocr import available_engine
 from .widgets import Choice, Toggle, MatchPreview, ActionMenu, ResultSplit
 from .permissions import is_windows_admin, request_elevation
 from .system_files import describe_failure, is_user_cancelled
 from .core import (FileActions, Scanner, data_dir, default_excludes,
-                   export_report, local_roots, normalize_keywords, save_json)
+                   export_report, local_roots, normalize_keywords, save_json, compact_paths, canonical)
 
 
 def size_text(size):
@@ -70,6 +72,8 @@ class App:
         self.permission_errors = 0
         self.preview_visible = True
         self.preview_ratio = .55
+        self.targeted_mode = False
+        self.target_origins = {}
         self.config = self.load_config()
         try:
             self.preview_ratio = max(.2, min(.8, float(self.config.get("preview_ratio", .55))))
@@ -85,6 +89,9 @@ class App:
         for path in self.config.get("excludes", default_excludes()):
             self.add_path(self.excludes_list, path)
         self.programs.set(self.config.get("programs", True))
+        self.scan_extra.set(self.config.get("scan_extra", False))
+        self.scan_registry.set(self.config.get("scan_registry", False))
+        self.ocr_images.set(self.config.get("ocr_images", False))
         self.scan_mode.set(next((label for label, mode in SCAN_MODES.items() if mode == self.config.get("scan_mode")), "文件名"))
         self.content_limit.set(str(self.config.get("max_content_mb", 50)))
         self.update_content_controls()
@@ -123,6 +130,8 @@ class App:
             save_json(self.config_path, {"roots": list(self.roots_list.get(0, "end")),
                 "keywords": list(self.keywords_list.get(0, "end")),
                 "excludes": list(self.excludes_list.get(0, "end")), "programs": self.programs.get(),
+                "scan_extra": self.scan_extra.get(), "scan_registry": self.scan_registry.get(),
+                "ocr_images": self.ocr_images.get(),
                 "sidebar_collapsed": self.sidebar_collapsed, "scan_mode": SCAN_MODES[self.scan_mode.get()],
                 "content_types": self.content_types, "max_content_mb": self.content_limit.get(),
                 "preview_visible": self.preview_visible, "preview_ratio": self.preview_ratio})
@@ -295,13 +304,29 @@ class App:
         self.roots_list = self.listbox(scopes)
         self.root_buttons = self.button_row(scopes, 2, [("添加目录", lambda: self.choose_path(self.roots_list)),
             ("移除", lambda: self.remove_list(self.roots_list))])
-        self.detect_button = ttk.Button(scopes, text="全盘扫描设置", style="Primary.TButton", command=self.prepare_full_scan)
-        self.detect_button.grid(row=3, column=0, sticky="ew", pady=(s(6), s(14)))
+        scan_buttons = ttk.Frame(scopes, style="Card.TFrame")
+        scan_buttons.grid(row=3, column=0, sticky="ew", pady=(s(6), s(14)))
+        scan_buttons.columnconfigure(0, weight=1, uniform="scan_buttons")
+        scan_buttons.columnconfigure(1, weight=1, uniform="scan_buttons")
+        self.detect_button = ttk.Button(scan_buttons, text="全盘设置", style="Primary.TButton", command=self.prepare_full_scan)
+        self.detect_button.grid(row=0, column=0, sticky="ew", padx=(0, s(6)))
+        self.target_button = ttk.Button(scan_buttons, text="上次命中目录", command=self.prepare_targeted_scan)
+        self.target_button.grid(row=0, column=1, sticky="ew")
         self.programs = tk.BooleanVar(value=True)
         self.program_check = Toggle(scopes, text="检查已安装程序（名称）", variable=self.programs, width=1)
         self.program_check.grid(row=4, column=0, sticky="ew")
+        self.scan_extra = tk.BooleanVar(value=False)
+        Toggle(scopes, text="配置 / 应用缓存与历史", variable=self.scan_extra, width=1).grid(
+            row=5, column=0, sticky="ew", pady=(s(4), 0))
+        self.scan_registry = tk.BooleanVar(value=False)
+        if os.name == "nt":
+            Toggle(scopes, text="Windows 注册表（只读文字）", variable=self.scan_registry, width=1).grid(
+                row=6, column=0, sticky="ew", pady=(s(4), 0))
+        self.ocr_images = tk.BooleanVar(value=False)
+        self.ocr_toggle = Toggle(scopes, text="图片文字识别 OCR（可选）", variable=self.ocr_images, width=1)
+        self.ocr_toggle.grid(row=7, column=0, sticky="ew", pady=(s(4), 0))
         mode_row = ttk.Frame(scopes, style="Card.TFrame")
-        mode_row.grid(row=5, column=0, sticky="ew", pady=(s(8), 0))
+        mode_row.grid(row=8, column=0, sticky="ew", pady=(s(8), 0))
         mode_row.columnconfigure(1, weight=1)
         ttk.Label(mode_row, text="扫描", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(8)))
         self.scan_mode = tk.StringVar(value="文件名")
@@ -309,7 +334,7 @@ class App:
         self.mode_choice.grid(row=0, column=1, sticky="ew")
         self.scan_mode.trace_add("write", self.update_content_controls)
         options_row = ttk.Frame(scopes, style="Card.TFrame")
-        options_row.grid(row=6, column=0, sticky="ew", pady=(s(6), 0))
+        options_row.grid(row=9, column=0, sticky="ew", pady=(s(6), 0))
         options_row.columnconfigure(0, weight=1)
         self.content_type_button = ttk.Button(options_row, text="内容类型", style="Compact.TButton", command=self.choose_content_types)
         self.content_type_button.grid(row=0, column=0, sticky="w")
@@ -318,7 +343,8 @@ class App:
         self.content_limit_entry = ttk.Entry(options_row, textvariable=self.content_limit, width=4, justify="center")
         self.content_limit_entry.grid(row=0, column=2)
         ttk.Label(options_row, text="MB", style="Muted.TLabel").grid(row=0, column=3, padx=(s(4), 0))
-        ttk.Label(scopes, text="内容匹配可查看命中片段。\n超限、加密或损坏项记录原因。", style="Muted.TLabel").grid(row=7, column=0, sticky="w", pady=(s(8), s(2)))
+        ttk.Label(scopes, text="OCR 使用随程序附带的本地中英文模型。\n额外位置只扫描当前账户可读项。", style="Muted.TLabel").grid(
+            row=10, column=0, sticky="w", pady=(s(8), s(2)))
         ttk.Label(keywords, text="所选扫描范围包含任意词即命中", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         self.keywords_list = self.listbox(keywords)
         entry_row = ttk.Frame(keywords, style="Card.TFrame")
@@ -384,7 +410,7 @@ class App:
         self.keyword_choice = Choice(filters, self.keyword_filter, ("全部关键词",), width=13)
         self.keyword_choice.grid(row=0, column=2, padx=(0, s(8)))
         self.kind = tk.StringVar(value="全部类型")
-        self.kind_choice = Choice(filters, self.kind, ("全部类型", "文件", "目录", "程序"), width=9)
+        self.kind_choice = Choice(filters, self.kind, ("全部类型", "文件", "目录", "程序", "注册表"), width=9)
         self.kind_choice.grid(row=0, column=3)
         file_filters = ttk.Frame(filters, style="Card.TFrame")
         file_filters.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(s(8), 0))
@@ -400,19 +426,24 @@ class App:
         ttk.Button(file_filters, text="重置筛选", style="Compact.TButton", command=self.reset_filters).grid(row=0, column=5)
         extra_filters = ttk.Frame(filters, style="Card.TFrame")
         extra_filters.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(s(8), 0))
-        extra_filters.columnconfigure(1, weight=1)
-        ttk.Label(extra_filters, text="来源", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
+        extra_filters.columnconfigure(3, weight=1)
+        ttk.Label(extra_filters, text="命中", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
         self.source_filter = tk.StringVar(value="全部来源")
         self.source_choice = Choice(extra_filters, self.source_filter, ("全部来源", "包含内容命中", "仅名称命中"), width=16)
         self.source_choice.grid(row=0, column=1, sticky="w")
+        ttk.Label(extra_filters, text="位置", style="Muted.TLabel").grid(row=0, column=2, padx=(s(10), s(8)))
+        self.origin_filter = tk.StringVar(value="全部位置")
+        self.origin_choice = Choice(extra_filters, self.origin_filter, ("全部位置", "普通文件"), width=14)
+        self.origin_choice.grid(row=0, column=3, sticky="w")
         self.export_filtered = tk.BooleanVar(value=False)
-        Toggle(extra_filters, text="报告仅含当前筛选", variable=self.export_filtered, width=21).grid(row=0, column=2, sticky="e")
+        Toggle(extra_filters, text="报告仅含当前筛选", variable=self.export_filtered, width=21).grid(row=0, column=4, sticky="e")
         self.query.trace_add("write", self.schedule_filter)
         self.keyword_filter.trace_add("write", self.schedule_filter)
         self.kind.trace_add("write", self.schedule_filter)
         self.file_category.trace_add("write", self.schedule_filter)
         self.extensions.trace_add("write", self.schedule_filter)
         self.source_filter.trace_add("write", self.schedule_filter)
+        self.origin_filter.trace_add("write", self.schedule_filter)
         self.results_split = ResultSplit(right, ratio=self.preview_ratio, on_ratio_change=self.remember_preview_ratio)
         self.results_split.grid(row=3, column=0, sticky="nsew")
         table = ttk.Frame(self.results_split, style="Card.TFrame")
@@ -420,9 +451,9 @@ class App:
         table.grid_propagate(False)
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
-        columns = ("kind", "path", "keywords", "match_source", "size", "modified")
+        columns = ("kind", "path", "origin", "keywords", "match_source", "size", "modified")
         self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="extended")
-        for column, caption, width in zip(columns, ("类型", "完整路径 / 程序名", "命中关键词", "命中来源", "大小", "修改时间"), (58, 310, 130, 90, 85, 145)):
+        for column, caption, width in zip(columns, ("类型", "完整路径 / 程序名", "位置来源", "命中关键词", "命中来源", "大小", "修改时间"), (68, 310, 115, 130, 90, 85, 145)):
             self.tree.heading(column, text=caption, anchor="w", command=lambda c=column: self.sort(c))
             self.tree.column(column, width=s(width), minwidth=s(220 if column == "path" else 45), stretch=column == "path", anchor="w")
         ys = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -435,7 +466,7 @@ class App:
         self.results_split.add_bottom(self.preview)
         self.preview.grid_propagate(False)
         self.tree.bind("<<TreeviewSelect>>", self.selection_changed)
-        self.tree.bind("<Double-1>", lambda _e: self.open_folder())
+        self.tree.bind("<Double-1>", lambda _e: self.open_result())
         self.tree.bind("<Button-3>", self.context_menu)
         self.tree.bind("<Control-a>", self.select_all)
         self.tree.bind("<Command-a>", self.select_all)
@@ -445,7 +476,7 @@ class App:
         action_bar.columnconfigure(2, weight=1)
         for col, caption, command in ((0, "全选", self.select_all), (1, "清除选择", lambda: self.tree.selection_remove(self.tree.selection()))):
             ttk.Button(action_bar, text=caption, command=command, style="Link.TButton").grid(row=0, column=col, padx=(0, s(4)))
-        actions = (("打开目录", self.open_folder), ("复制路径", self.copy_paths),
+        actions = (("定位文件", self.open_folder), ("复制路径", self.copy_paths),
                    ("移动", lambda: self.operate("move")), ("删除", lambda: self.operate("delete")))
         self.file_buttons = []
         for index, (caption, command) in enumerate(actions, 3):
@@ -487,7 +518,7 @@ class App:
 
     def update_content_controls(self, *_args):
         enabled = self.scan_mode.get() != "文件名" and not self.busy
-        for widget in (self.content_type_button, self.content_limit_entry):
+        for widget in (self.content_type_button, self.content_limit_entry, self.ocr_toggle):
             widget.configure(state="normal" if enabled else "disabled")
 
     def choose_content_types(self):
@@ -503,7 +534,9 @@ class App:
             Toggle(panel, text=name, variable=selected[name], width=18).grid(row=row, column=0, sticky="ew", pady=4)
             sample = ", ".join(suffixes[:5]) + (" …" if len(suffixes) > 5 else "")
             ttk.Label(panel, text=sample).grid(row=row, column=1, sticky="w", padx=(15, 0))
-        ttk.Label(panel, text="蓝色表示已选；点击切换。单文件最多读取 30 秒；图片和扫描版 PDF 不执行 OCR。").grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 8))
+        end_row = len(CONTENT_TYPES)
+        ttk.Label(panel, text="蓝色表示已选；点击切换。单文件最多读取 30 秒；图片 OCR 由目录页单独启用。").grid(
+            row=end_row, column=0, columnspan=2, sticky="w", pady=(12, 8))
         def save():
             values = [name for name, variable in selected.items() if variable.get()]
             if not values:
@@ -511,8 +544,8 @@ class App:
                 return
             self.content_types = values
             dialog.destroy()
-        ttk.Button(panel, text="确定", style="Primary.TButton", command=save).grid(row=8, column=1, sticky="e")
-        ttk.Button(panel, text="取消", command=dialog.destroy).grid(row=8, column=0, sticky="w")
+        ttk.Button(panel, text="确定", style="Primary.TButton", command=save).grid(row=end_row+1, column=1, sticky="e")
+        ttk.Button(panel, text="取消", command=dialog.destroy).grid(row=end_row+1, column=0, sticky="w")
         dialog.grab_set()
 
     def remember_preview_ratio(self, ratio):
@@ -600,6 +633,8 @@ class App:
         if not roots:
             messagebox.showinfo("未找到本机磁盘", "请使用“添加目录”选择扫描位置。", parent=self.root)
             return
+        self.targeted_mode = False
+        self.target_origins = {}
         self.roots_list.delete(0, "end")
         for path in roots:
             self.add_path(self.roots_list, path)
@@ -607,11 +642,59 @@ class App:
         self.content_types = list(CONTENT_TYPES)
         self.content_limit.set("256")
         self.programs.set(True)
+        self.scan_extra.set(True)
+        if os.name == "nt":
+            self.scan_registry.set(True)
         if self.sidebar_collapsed:
             self.toggle_sidebar()
         self.select_settings_page(0)
         self.status.set(f"已设置 {len(roots)} 个本机磁盘 · 点击“开始扫描”执行")
         self.current.set("匹配文件名与全部支持类型的内容，单文件上限 256 MB；保留排除目录，未读项见“扫描覆盖 / 错误”。")
+
+    def prepare_targeted_scan(self):
+        if self.busy:
+            return
+        try:
+            saved = json.loads((data_dir() / "roots.json").read_text(encoding="utf-8"))
+            entries = saved.get("roots", [])
+            if not isinstance(entries, list):
+                raise ValueError("定点扫描记录格式无效")
+            available = [(item["path"], item.get("origin", "普通文件")) for item in entries
+                         if isinstance(item, dict) and isinstance(item.get("path"), str)
+                         and isinstance(item.get("origin", "普通文件"), str) and Path(item["path"]).is_dir()]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            messagebox.showinfo("暂无可用定点位置", "请先完成一次有命中结果的扫描。\n" + str(exc), parent=self.root)
+            return
+        if not available:
+            messagebox.showinfo("暂无可用定点位置", "上次扫描没有仍然存在的命中目录。", parent=self.root)
+            return
+        self.roots_list.delete(0, "end")
+        for path, _origin in available:
+            self.add_path(self.roots_list, path)
+        self.targeted_mode = True
+        self.target_origins = {canonical(path): origin for path, origin in available}
+        self.scan_extra.set(False)
+        self.scan_registry.set(False)
+        self.scan_mode.set("文件名 + 内容")
+        self.status.set(f"已选择 {len(available)} 个上次命中目录 · 点击“开始扫描”执行")
+        self.current.set("定点扫描只检查这些仍然存在的目录；本次不会额外遍历整盘或注册表。")
+
+    def save_trace_roots(self):
+        locations = {}
+        for hit in self.results.values():
+            if len(locations) >= 500:
+                break
+            if hit.kind not in ("文件", "目录") or hit.origin == "回收站":
+                continue
+            folder = Path(hit.path) if hit.kind == "目录" else Path(hit.path).parent
+            if folder.is_dir():
+                locations[canonical(folder)] = hit.origin
+        paths = compact_paths(list(locations))[:500]
+        try:
+            save_json(data_dir() / "roots.json", {"saved": datetime.now().isoformat(" ", timespec="seconds"),
+                "roots": [{"path": path, "origin": locations[path]} for path in paths]})
+        except OSError as exc:
+            self.error_samples.append("定点扫描目录未保存：" + str(exc))
 
     def add_keywords(self):
         value = self.keyword_entry.get().replace("；", ";")
@@ -652,10 +735,14 @@ class App:
         self.pause_button.configure(state="normal" if self.scanner else "disabled")
         self.stop_button.configure(state="normal" if self.scanner else "disabled")
         self.export_button.configure(state="disabled" if running else "normal")
+        selected = self.selected_hits()
+        can_change_files = not running and bool(selected) and all(
+            hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in selected)
         for button in self.file_buttons[2:]:
-            button.configure(state="disabled" if running else "normal")
+            button.configure(state="normal" if can_change_files else "disabled")
         self.mode_choice.set_enabled(not running)
         self.detect_button.configure(state="disabled" if running else "normal")
+        self.target_button.configure(state="disabled" if running else "normal")
         self.update_content_controls()
         if running:
             self.progress_bar.stop()
@@ -672,8 +759,13 @@ class App:
             return
         roots = list(self.roots_list.get(0, "end"))
         keywords = list(self.keywords_list.get(0, "end"))
-        if not roots or not keywords:
-            messagebox.showinfo("需要扫描范围和关键词", "请至少添加一个扫描目录和一个关键词。", parent=self.root)
+        extra_roots = discover_extra_roots() if self.scan_extra.get() else []
+        if self.targeted_mode:
+            extra_roots.extend((path, self.target_origins[canonical(path)]) for path in roots
+                               if canonical(path) in self.target_origins)
+        registry = os.name == "nt" and self.scan_registry.get()
+        if not keywords or not (roots or extra_roots or registry):
+            messagebox.showinfo("需要扫描范围和关键词", "请添加关键词，并选择目录、缓存或 Windows 注册表。", parent=self.root)
             return
         mode = SCAN_MODES[self.scan_mode.get()]
         try:
@@ -688,8 +780,14 @@ class App:
         if mode != "name" and not self.content_types:
             messagebox.showinfo("内容类型", "请至少选择一种内容扫描类型。", parent=self.root)
             return
+        ocr_engine = ocr_language = ocr_warning = ""
+        if mode != "name" and self.ocr_images.get():
+            ocr_engine, ocr_language, ocr_warning = available_engine()
+            if not ocr_engine:
+                messagebox.showinfo("图片文字识别不可用", ocr_warning + "。请检查程序文件是否完整；源码运行请安装 OCR 依赖。", parent=self.root)
+                return
         invalid = [p for p in roots if not Path(p).is_dir()]
-        if invalid and len(invalid) == len(roots):
+        if invalid and len(invalid) == len(roots) and not (extra_roots or registry):
             messagebox.showerror("目录不可用", "请移除或重新选择以下目录：\n" + "\n".join(invalid), parent=self.root)
             return
         if self.results and not messagebox.askyesno("开始新扫描", "本次将清空界面中的旧结果。需要保留时请先导出报告。继续？", parent=self.root):
@@ -699,6 +797,10 @@ class App:
         self.tree.delete(*self.tree.get_children())
         self.results.clear()
         self.keyword_choice.set_values(("全部关键词", *keywords))
+        self.origin_choice.set_values(tuple(dict.fromkeys(("全部位置", "普通文件",
+            *(label for _path, label in extra_roots),
+            *(["已安装程序"] if self.programs.get() else []),
+            *(["Windows 注册表", "打开历史", "系统痕迹（注册表）"] if registry else [])))))
         self.selected_path.set("")
         self.preview.set_hit(None)
         self.next_id = 0
@@ -708,16 +810,23 @@ class App:
         self.action_log = []
         self.metadata = {"version": VERSION, "started": datetime.now().isoformat(" ", timespec="seconds"),
             "roots": roots, "keywords": keywords, "excludes": list(self.excludes_list.get(0, "end")),
-            "programs": self.programs.get(), "match": self.scan_mode.get() + "包含关键词，忽略大小写",
+            "programs": self.programs.get(), "scan_extra": bool(extra_roots),
+            "extra_roots": [{"path": path, "label": label} for path, label in extra_roots],
+            "scan_registry": registry, "match": self.scan_mode.get() + "包含关键词，忽略大小写",
+            "targeted": self.targeted_mode,
+            "ocr_images": bool(ocr_engine), "ocr_language": ocr_language,
+            "ocr_warning": ocr_warning,
             "scan_mode": mode, "content_types": list(self.content_types), "max_content_mb": limit,
             "unavailable_roots": invalid,
             "error_log": str(data_dir() / "logs" / ("scan_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jsonl"))}
         self.scanner = Scanner(roots, keywords, self.events, self.metadata["excludes"], self.programs.get(),
-            scan_mode=mode, content_types=self.content_types, max_content_mb=limit, error_log=self.metadata["error_log"])
+            scan_mode=mode, content_types=self.content_types, max_content_mb=limit,
+            error_log=self.metadata["error_log"], extra_roots=extra_roots, registry=registry,
+            ocr_engine=ocr_engine or None, ocr_language=ocr_language)
         self.thread = threading.Thread(target=self.scanner.run, daemon=True)
         self.pause_button.configure(text="暂停")
         self.status.set("正在扫描…")
-        self.current.set("正在准备扫描目录…")
+        self.current.set(ocr_warning or "正在准备扫描目录…")
         self.update_metrics(dict(examined=0, hits=0, errors=0, elapsed=0))
         self.update_count()
         self.set_running(True)
@@ -751,11 +860,15 @@ class App:
         keyword = self.keyword_filter.get()
         matched_words = hit.matched_keywords or hit.keywords.split(" | ")
         source = self.source_filter.get()
+        origin = self.origin_filter.get()
         return (self.kind.get() == "全部类型" or hit.kind == self.kind.get()) and matches_file_filter(
             hit.path, hit.kind, self.file_category.get(), self.extensions.get()) and (
+            origin == "全部位置" or hit.origin == origin) and (
             keyword == "全部关键词" or any(word.casefold() == keyword.casefold() for word in matched_words)) and (
-            source == "全部来源" or source == "包含内容命中" and hit.match_source in ("内容", "名称+内容") or
-            source == "仅名称命中" and hit.match_source not in ("内容", "名称+内容")) and (
+            source == "全部来源" or source == "包含内容命中" and hit.match_source in (
+                "内容", "名称+内容", "注册表数据", "注册表名称+数据", "图片OCR", "名称+OCR") or
+            source == "仅名称命中" and hit.match_source not in (
+                "内容", "名称+内容", "注册表数据", "注册表名称+数据", "图片OCR", "名称+OCR")) and (
             not query or query in (hit.path + " " + hit.keywords + " " + hit.detail).casefold())
 
     def reset_filters(self):
@@ -765,6 +878,7 @@ class App:
         self.file_category.set("全部文件类别")
         self.extensions.set("")
         self.source_filter.set("全部来源")
+        self.origin_filter.set("全部位置")
 
     def focus_result_search(self, _event=None):
         self.query_entry.focus_set()
@@ -772,7 +886,7 @@ class App:
         return "break"
 
     def insert_hit(self, key, hit):
-        self.tree.insert("", "end", iid=key, values=(hit.kind, hit.path, hit.keywords,
+        self.tree.insert("", "end", iid=key, values=(hit.kind, hit.path, hit.origin, hit.keywords,
             hit.match_source or ("程序名称" if hit.kind == "程序" else "文件名"),
             size_text(hit.size) if hit.kind == "文件" else "—",
             datetime.fromtimestamp(hit.modified).strftime("%Y-%m-%d %H:%M") if hit.modified else "—"))
@@ -786,6 +900,10 @@ class App:
         self.selected_path.set(hits[0].path if hits else "")
         self.selected_path_entry.xview_moveto(0)
         self.preview.set_hit(hits[0] if hits else None, selected=len(hits))
+        can_change_files = bool(hits) and all(
+            hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in hits) and not self.busy
+        for button in self.file_buttons[2:]:
+            button.configure(state="normal" if can_change_files else "disabled")
 
     def view_paths(self):
         hits = self.selected_hits()
@@ -907,6 +1025,8 @@ class App:
                 self.metadata["errors"] = self.error_samples
                 self.metadata["permission_errors"] = self.permission_errors
                 self.metadata["denied_paths"] = self.denied_paths
+                self.save_trace_roots()
+                self.metadata["errors"] = self.error_samples
                 self.set_running(False)
                 summary = self.metadata.get("progress", {})
                 state = "已停止（部分结果）" if payload["cancelled"] else "扫描结束"
@@ -949,16 +1069,18 @@ class App:
             self.tree.selection_set(item)
         if not item and not self.tree.selection():
             return
+        hits = self.selected_hits()
         groups = [
-            [("⌁  打开所在目录", self.open_folder, False),
-             ("▢  复制完整路径", self.copy_paths, False),
+            [("⌁  定位文件或目录", self.open_folder, False),
+             ("▢  复制位置", self.copy_paths, False),
              ("↗  查看完整路径", self.view_paths, False),
              ("◈  查看匹配内容", self.view_matches, False)],
-            [("➜  移动选中项", lambda: self.operate("move"), False),
-             ("⌫  移入系统回收站", lambda: self.operate("delete"), True)],
         ]
-        if os.name != "nt":
-            groups[-1].append(("✕  彻底删除（需确认）", lambda: self.operate("delete", permanent=True), True))
+        if hits and all(hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in hits):
+            groups.append([("➜  移动选中项", lambda: self.operate("move"), False),
+                           ("⌫  移入系统回收站", lambda: self.operate("delete"), True)])
+            if os.name != "nt":
+                groups[-1].append(("✕  彻底删除（需确认）", lambda: self.operate("delete", permanent=True), True))
         if self.actions.bin.is_dir():
             groups.append([("↶  恢复旧版文件", self.recovery, False)])
         self.menu.show(event.x_root, event.y_root, groups)
@@ -968,7 +1090,7 @@ class App:
         if hits:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(h.path for h in hits))
-            self.status.set(f"已复制 {len(hits)} 个路径 / 程序名")
+            self.status.set(f"已复制 {len(hits)} 个位置")
 
     def open_folder(self):
         hits = self.selected_hits()
@@ -976,6 +1098,10 @@ class App:
             messagebox.showinfo("选择结果", "请先选中要打开的结果。", parent=self.root)
             return
         hit = hits[0]
+        if hit.kind == "注册表":
+            self.copy_paths()
+            messagebox.showinfo("注册表位置已复制", "这是只读结果。请在 Windows 注册表编辑器中按复制的位置查找。", parent=self.root)
+            return
         if hit.kind == "程序" and not Path(hit.path).is_absolute():
             messagebox.showinfo("程序清单", "此项来自系统已安装程序列表，没有可打开的目录。", parent=self.root)
             return
@@ -986,10 +1112,35 @@ class App:
             return
         try:
             if os.name == "nt":
-                os.startfile(str(folder))
+                if hit.kind == "文件" and path.exists():
+                    subprocess.Popen(["explorer.exe", "/select," + str(path)])
+                else:
+                    os.startfile(str(folder))
+            elif platform.system() == "Darwin" and hit.kind == "文件" and path.exists():
+                subprocess.Popen(["open", "-R", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 subprocess.Popen(["open" if platform.system() == "Darwin" else "xdg-open", str(folder)],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            messagebox.showerror("打开失败", str(exc), parent=self.root)
+
+    def open_result(self):
+        hits = self.selected_hits()
+        if not hits:
+            return
+        hit = hits[0]
+        safe = {".txt", ".md", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+        path = Path(hit.path)
+        if hit.kind != "文件" or path.suffix.casefold() not in safe or not path.is_file():
+            self.open_folder()
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["open" if platform.system() == "Darwin" else "xdg-open", str(path)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             messagebox.showerror("打开失败", str(exc), parent=self.root)
 
@@ -1053,8 +1204,8 @@ class App:
         if not hits:
             messagebox.showinfo("选择文件", "请先选中需要操作的文件或目录。", parent=self.root)
             return
-        if any(h.kind == "程序" for h in hits):
-            messagebox.showinfo("包含程序结果", "请取消选择程序项。程序只能查看，文件和目录可以移动或删除。", parent=self.root)
+        if any(h.kind not in ("文件", "目录") or h.origin == "回收站" for h in hits):
+            messagebox.showinfo("包含只读结果", "请只选择普通文件或目录。注册表、程序及回收站结果只能查看和复制。", parent=self.root)
             return
         hits = self.actions.selected(hits)
         destination = None
@@ -1300,14 +1451,28 @@ class App:
         if self.scanner:
             self.denied_paths = list(self.scanner.denied_paths)
         coverage = (dict(files=self.scanner.files_examined, unsupported=self.scanner.content_unsupported,
-            excluded=self.scanner.excluded_entries, links=self.scanner.links_skipped) if self.scanner else self.metadata.get("coverage", {}))
+            excluded=self.scanner.excluded_entries, links=self.scanner.links_skipped,
+            registry_keys=self.scanner.registry_keys, registry_values=self.scanner.registry_values,
+            registry_unreadable=self.scanner.registry_unreadable,
+            ocr_examined=self.scanner.ocr_examined) if self.scanner else self.metadata.get("coverage", {}))
         progress = (dict(content_read=self.scanner.content_read, content_skipped=self.scanner.content_skipped,
             errors=self.scanner.errors) if self.scanner else self.metadata.get("progress", {}))
         roots = self.metadata.get("roots", [])
         content = "扫描范围：\n" + ("\n".join(roots) if roots else "尚未开始扫描") + "\n\n"
+        extra_roots = self.metadata.get("extra_roots", [])
+        if extra_roots:
+            content += "额外配置与缓存位置：\n" + "\n".join(f"{item['label']}：{item['path']}" for item in extra_roots) + "\n\n"
+        if self.metadata.get("scan_registry"):
+            content += "Windows 注册表：HKCU、HKLM、HKU 的可读取键名和文字/数字值；合并视图 HKCR、HKCC 不重复遍历。\n\n"
         content += f"文件检查 {coverage.get('files', 0)} 项；内容已读取 {progress.get('content_read', 0)} 项；内容未完整读取 {progress.get('content_skipped', 0)} 项。\n"
+        if self.metadata.get("scan_registry"):
+            content += f"注册表键检查 {coverage.get('registry_keys', 0)} 项；值检查 {coverage.get('registry_values', 0)} 项；二进制/过大或不支持类型 {coverage.get('registry_unreadable', 0)} 项。\n"
+        if self.metadata.get("ocr_images"):
+            content += f"图片 OCR 尝试 {coverage.get('ocr_examined', 0)} 项，语言：{self.metadata.get('ocr_language', '未知')}。识别质量受图片清晰度和语言包影响；失败项记录在错误清单。\n"
+            if self.metadata.get("ocr_warning"):
+                content += self.metadata["ocr_warning"] + "。\n"
         content += f"未选类型 / 不支持格式 {coverage.get('unsupported', 0)} 项；排除的文件或目录入口 {coverage.get('excluded', 0)} 项；链接 / 联接点入口 {coverage.get('links', 0)} 项。\n"
-        content += f"本次模式：{self.metadata.get('match', '尚未扫描')}。未选或不支持的格式不算已完成内容扫描。图片及扫描版 PDF 不执行 OCR，压缩包内文件与嵌入对象不读取。\n\n"
+        content += f"本次模式：{self.metadata.get('match', '尚未扫描')}。未选或不支持的格式不算已完成内容扫描。扫描版 PDF 不执行 OCR，压缩包内文件与嵌入对象不读取。\n\n"
         if self.metadata.get("unavailable_roots"):
             content += "开始时不可用的目录 / 磁盘，已记录后继续其余范围：\n" + "\n".join(self.metadata["unavailable_roots"]) + "\n\n"
         content += "扫描跳过用户排除目录、符号链接、Windows 联接点和工具数据目录。权限错误只影响当前项，其余继续。\n"

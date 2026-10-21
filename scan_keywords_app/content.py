@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import codecs
+from contextlib import closing
 import multiprocessing as mp
 from pathlib import Path
+import plistlib
 import re
+import sqlite3
 import struct
 import sys
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 from .matching import MatchCollector
+from .ocr import IMAGE_SUFFIXES, ocr_lines
 
 CONTENT_TYPES = {
     "Word 文档": ("doc", "docx", "docm", "dotx", "dotm"),
@@ -20,6 +24,7 @@ CONTENT_TYPES = {
     "PDF 文件": ("pdf",),
     "RTF 文档": ("rtf",),
     "OpenDocument": ("odt", "ods", "odp"),
+    "配置与缓存": ("plist", "desktop", "properties", "toml", "url", "webloc", "xbel", "db", "sqlite", "sqlite3"),
 }
 SCAN_MODES = {"文件名": "name", "文件内容": "content", "文件名 + 内容": "both"}
 XML_LIMIT = 16 * 1024 * 1024
@@ -296,10 +301,89 @@ def _text_file(path):
         raise ContentReadError("文本编码无法识别，或文件虽有文本后缀但实际为二进制数据；此文件内容已跳过") from exc
 
 
-def iter_content(path):
+def looks_like_text(path):
+    """Conservatively sniff otherwise unsupported files in selected cache roots."""
+    with Path(path).open("rb") as stream:
+        head = stream.read(4096)
+    if not head:
+        return False
+    if head.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE,
+                        codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return True
+    if head.startswith((b"SQLite format 3\0", b"PK\x03\x04", b"%PDF", b"\xd0\xcf\x11\xe0")):
+        return False
+    if b"\0" in head:
+        even, odd = head[::2].count(0), head[1::2].count(0)
+        return max(even, odd) > len(head) * .25 and min(even, odd) < len(head) * .05
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            text = head.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if sum(not (char.isprintable() or char in "\r\n\t") for char in text) <= max(1, len(text) // 100):
+            return True
+    return False
+
+
+def _plist(path):
+    try:
+        with path.open("rb") as stream:
+            value = plistlib.load(stream)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ContentReadError("配置文件无法解析") from exc
+    pending = [("配置", value, 0)]
+    while pending:
+        location, item, depth = pending.pop()
+        if depth > 64:
+            raise ContentReadError("配置文件嵌套过深")
+        if isinstance(item, dict):
+            for key, child in reversed(list(item.items())):
+                pending.append((f"{location} / {key}", child, depth + 1))
+        elif isinstance(item, list):
+            for index in range(len(item) - 1, -1, -1):
+                pending.append((f"{location} / {index + 1}", item[index], depth + 1))
+        elif isinstance(item, (str, int, float, bool)):
+            yield location, str(item)
+
+
+def _sqlite(path):
+    with path.open("rb") as stream:
+        if stream.read(16) != b"SQLite format 3\0":
+            raise ContentReadError("缓存文件不是 SQLite 数据库")
+    # immutable avoids creating WAL/shared-memory files alongside the source.
+    # Uncheckpointed WAL pages may therefore not be represented in the result.
+    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            for (table,) in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                cursor = connection.execute(f"SELECT * FROM {quoted}")
+                columns = [column[0] for column in cursor.description]
+                for row_number, row in enumerate(cursor, 1):
+                    for column, value in zip(columns, row):
+                        if isinstance(value, (str, int, float)):
+                            text = str(value)
+                            if len(text) > 1024 * 1024:
+                                raise ContentReadError("数据库单元格超过 1 MB 上限")
+                            yield f"表 {table} · 行 {row_number} · 列 {column}", text
+    except sqlite3.Error as exc:
+        raise ContentReadError("SQLite 数据库无法只读解析：" + str(exc)) from exc
+
+
+def iter_content(path, *, force_text=False, ocr_engine=None, ocr_language=""):
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix in (".docx", ".docm", ".dotx", ".dotm", ".pptx", ".pptm", ".ppsx", ".ppsm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".odt", ".ods", ".odp"):
+    if ocr_engine and suffix in IMAGE_SUFFIXES:
+        yield from ocr_lines(path, ocr_engine, ocr_language)
+    elif force_text:
+        yield from _text_file(path)
+    elif suffix == ".plist":
+        yield from _plist(path)
+    elif suffix in (".db", ".sqlite", ".sqlite3"):
+        yield from _sqlite(path)
+    elif suffix in (".docx", ".docm", ".dotx", ".dotm", ".pptx", ".pptm", ".ppsx", ".ppsm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".odt", ".ods", ".odp"):
         yield from _office_xml(path)
     elif suffix in (".doc", ".ppt", ".pps"):
         with path.open("rb") as stream:
@@ -357,12 +441,13 @@ def _worker(connection):
             return
         if job is None:
             return
-        path, keywords = job
+        path, keywords, force_text, ocr_engine, ocr_language = job
         collector = MatchCollector(keywords)
         error, permission = "", False
         total = 0
         try:
-            for location, text in iter_content(path):
+            for location, text in iter_content(path, force_text=force_text,
+                                               ocr_engine=ocr_engine, ocr_language=ocr_language):
                 total += len(text)
                 if total > EXPANDED_LIMIT:
                     raise ContentReadError("提取文字超过 64 MB 上限，文件未完整扫描")
@@ -383,7 +468,8 @@ class ContentReader:
         self.timeout = timeout
         self.process = self.connection = None
 
-    def read(self, path, keywords, checkpoint, progress):
+    def read(self, path, keywords, checkpoint, progress, *, force_text=False,
+             ocr_engine=None, ocr_language=""):
         if self.process is None:
             context = mp.get_context("spawn")
             self.connection, child = context.Pipe()
@@ -391,7 +477,7 @@ class ContentReader:
             self.process.start()
             child.close()
         try:
-            self.connection.send((str(path), keywords))
+            self.connection.send((str(path), keywords, force_text, ocr_engine, ocr_language))
         except (OSError, EOFError) as exc:
             self.close()
             raise ContentReadError("内容读取进程无法接收文件，已跳过") from exc

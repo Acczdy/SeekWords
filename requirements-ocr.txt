@@ -1,0 +1,3 @@
+# CPU-only OCR with three Chinese/English ONNX models bundled by RapidOCR.
+rapidocr==3.10.0
+onnxruntime==1.23.2

@@ -31,12 +31,19 @@ def _metadata_summary(metadata, hits):
     progress = metadata.get("progress", {}) or {}
     coverage = metadata.get("coverage", {}) or {}
     kinds = Counter(hit.kind for hit in hits)
-    return {
+    summary = {
         "结果": len(hits), "文件": kinds.get("文件", 0), "目录": kinds.get("目录", 0),
-        "程序": kinds.get("程序", 0), "已检查": progress.get("examined", 0),
+        "程序": kinds.get("程序", 0), "注册表": kinds.get("注册表", 0),
+        "已检查项": progress.get("examined", 0),
         "读取内容": progress.get("content_read", 0), "未完整读取": progress.get("content_skipped", 0),
         "扫描错误": progress.get("errors", 0), "排除入口": coverage.get("excluded", 0),
     }
+    if metadata.get("scan_registry"):
+        summary["注册表键"] = coverage.get("registry_keys", 0)
+        summary["注册表值"] = coverage.get("registry_values", 0)
+    if metadata.get("ocr_images"):
+        summary["OCR 图片"] = coverage.get("ocr_examined", 0)
+    return summary
 
 
 def _write_html(path, hits, metadata):
@@ -56,6 +63,11 @@ def _write_html(path, hits, metadata):
     chips = "".join(f"<span class=chip>{_html(word)}</span>" for word in words) or "<span class=muted>未设置</span>"
     root_lines = "".join(f"<li>{_html(root)}</li>" for root in roots) or "<li>未记录</li>"
     exclude_lines = "".join(f"<li>{_html(item)}</li>" for item in excludes) or "<li>无</li>"
+    auxiliary = metadata.get("extra_roots", []) or []
+    auxiliary_lines = "".join(f"<li>{_html(item.get('label', '其他'))}：{_html(item.get('path', ''))}</li>"
+                              for item in auxiliary) or "<li>未启用</li>"
+    origins = sorted({hit.origin for hit in hits})
+    origin_options = "".join(f'<option value="{_html(origin)}">{_html(origin)}</option>' for origin in origins)
     pieces = []
     for index, hit in enumerate(hits, 1):
         path_text = _html(hit.path)
@@ -71,13 +83,15 @@ def _write_html(path, hits, metadata):
             matches.append(f'<p class="notice">内容未完整读取：{_html(hit.content_error)}</p>')
         if not matches:
             matches.append('<p class="muted">此项通过名称命中，没有内容片段。</p>')
+        trace = "".join(f"<span>{_html(line)}</span>" for line in hit.detail.splitlines()
+                        if hit.origin == "回收站" and line.startswith(("原路径：", "删除时间：")))
         pieces.append(
-            f'<article class="result" data-kind="{_html(hit.kind)}">'
+            f'<article class="result" data-kind="{_html(hit.kind)}" data-origin="{_html(hit.origin)}">'
             f'<div class="result-head"><span class="ordinal">{index:03}</span><span class="kind">{_html(hit.kind)}</span>'
             f'<span class="path">{path_text}</span></div>'
-            f'<div class="meta"><span>来源：{_html(hit.match_source or "名称")}</span>'
-            f'<span>大小：{_html(hit.size)} B</span><span>修改：{_html(_timestamp(hit.modified))}</span>'
-            f'<span>内容命中：{_html(hit.match_count)} 处</span></div>'
+            f'<div class="meta"><span>位置：{_html(hit.origin)}</span><span>命中：{_html(hit.match_source or "名称")}</span>'
+            f'<span>大小：{_html(hit.size) + " B" if hit.kind == "文件" else "—"}</span><span>修改：{_html(_timestamp(hit.modified))}</span>'
+            f'<span>内容命中：{_html(hit.match_count)} 处</span>{trace}</div>'
             f'<div class="tags">{tags}</div>'
             f'<details><summary>查看命中位置与内容</summary>{"".join(matches)}</details></article>')
     errors = metadata.get("errors", []) or []
@@ -97,7 +111,7 @@ h1{{font-size:27px;margin:0 0 4px}}header p{{margin:4px 0;opacity:.86}}.status{{
 .metric strong{{display:block;font-size:23px;color:var(--blue);line-height:1.2}}.metric span{{color:var(--muted);font-size:12px}}
 .panel{{padding:22px;margin-bottom:18px}}h2{{font-size:17px;margin:0 0 12px}}.scope{{display:grid;grid-template-columns:1fr 1fr;gap:20px}}
 ul{{margin:4px 0 0;padding-left:20px;overflow-wrap:anywhere}}.chips,.tags{{display:flex;gap:7px;flex-wrap:wrap}}.chip{{border-radius:6px;background:#e9efff;color:#3155b6;padding:2px 8px;font-size:12px}}
-.toolbar{{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:20px 0 12px}}input,button{{font:inherit;border-radius:8px;border:1px solid #cdd8e8;padding:8px 11px;background:white;color:var(--ink)}}
+.toolbar{{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:20px 0 12px}}input,button,select{{font:inherit;border-radius:8px;border:1px solid #cdd8e8;padding:8px 11px;background:white;color:var(--ink)}}
 input{{flex:1;min-width:240px}}button{{cursor:pointer}}button.active,button:hover{{background:#e9efff;color:#2c51bf;border-color:#aebff2}}.result{{padding:15px 18px;margin:9px 0}}
 .result-head{{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}}.ordinal{{font-size:11px;color:var(--muted)}}.kind{{border-radius:5px;background:#e8f2fb;padding:1px 7px;font-size:12px}}
 .path{{font-weight:600;overflow-wrap:anywhere;user-select:text}}.meta{{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:5px 0 9px}}
@@ -112,17 +126,20 @@ footer{{font-size:12px;color:var(--muted);margin-top:28px}}@media(max-width:640p
 <section class="panel scope"><div><h2>扫描范围</h2><ul>{root_lines}</ul><h2 style="margin-top:18px">排除目录</h2><ul>{exclude_lines}</ul></div>
 <div><h2>匹配设置</h2><p>模式：{_html(metadata.get("match", "—"))}</p><p>关键词：</p><div class="chips">{chips}</div>
 <p class="muted">内容扫描只覆盖已选且支持的可读取格式；受限、占用、超限或未选格式请结合覆盖统计与错误清单核对。</p></div></section>
+<section class="panel"><h2>额外来源</h2><ul>{auxiliary_lines}</ul>
+<p class="muted">Windows 注册表：{"已选，只读可读文字" if metadata.get("scan_registry") else "未选"}；图片 OCR：{_html(metadata.get("ocr_language") or "未选")}。</p></section>
 <section><h2>结果 <span id="shown">{len(hits)}</span> / {len(hits)}</h2>
 <div class="toolbar"><input id="query" type="search" aria-label="筛选路径或关键词" placeholder="搜索路径、关键词或内容…">
-<button class="active" data-filter="全部">全部</button><button data-filter="文件">文件</button><button data-filter="目录">目录</button><button data-filter="程序">程序</button></div>
+<button class="active" data-filter="全部">全部</button><button data-filter="文件">文件</button><button data-filter="目录">目录</button><button data-filter="程序">程序</button><button data-filter="注册表">注册表</button>
+<select id="origin" aria-label="筛选位置来源"><option value="">全部位置</option>{origin_options}</select></div>
 <div id="results">{"".join(pieces) or '<div class="panel muted">没有匹配结果。</div>'}</div></section>
 <section class="panel" style="margin-top:24px"><h2>扫描错误与跳过</h2><ul>{error_preview}</ul><p class="muted">{_html(error_note)}</p>
 <p class="muted">完整错误日志：{_html(source_log or "未生成")}</p></section>
 <footer>本报告保存在本机，可离线打开。数据仅来自扫描时保存的结果与片段。文件操作后的报告只包含当前保留的结果。</footer>
 </main><script>
-const q=document.querySelector('#query'), rows=[...document.querySelectorAll('.result')], buttons=[...document.querySelectorAll('[data-filter]')];
-let kind='全部';function filter(){{const term=q.value.trim().toLocaleLowerCase();let shown=0;for(const row of rows){{let visible=(kind==='全部'||row.dataset.kind===kind)&&row.textContent.toLocaleLowerCase().includes(term);row.hidden=!visible;if(visible)shown++;}}document.querySelector('#shown').textContent=shown;}}
-q.addEventListener('input',filter);buttons.forEach(button=>button.addEventListener('click',()=>{{kind=button.dataset.filter;buttons.forEach(b=>b.classList.toggle('active',b===button));filter();}}));
+const q=document.querySelector('#query'), origin=document.querySelector('#origin'), rows=[...document.querySelectorAll('.result')], buttons=[...document.querySelectorAll('[data-filter]')];
+let kind='全部';function filter(){{const term=q.value.trim().toLocaleLowerCase();let shown=0;for(const row of rows){{let visible=(kind==='全部'||row.dataset.kind===kind)&&(!origin.value||row.dataset.origin===origin.value)&&row.textContent.toLocaleLowerCase().includes(term);row.hidden=!visible;if(visible)shown++;}}document.querySelector('#shown').textContent=shown;}}
+q.addEventListener('input',filter);origin.addEventListener('change',filter);buttons.forEach(button=>button.addEventListener('click',()=>{{kind=button.dataset.filter;buttons.forEach(b=>b.classList.toggle('active',b===button));filter();}}));
 </script></body></html>'''
     Path(path).write_text(document, encoding="utf-8")
 
@@ -144,13 +161,14 @@ def export_report(path, hits, metadata):
     elif suffix == ".csv":
         with open(path, "w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["类型", "完整路径", "关键词", "命中来源", "内容命中处数", "内容位置", "命中片段", "大小(B)", "修改时间", "内容读取提醒"])
+            writer.writerow(["类型", "完整路径", "位置来源", "关键词", "命中来源", "内容命中处数", "内容位置", "命中片段", "大小(B)", "修改时间", "内容读取提醒", "备注"])
             for hit in hits:
-                writer.writerow([_csv_cell(hit.kind), _csv_cell(hit.path), _csv_cell(hit.keywords),
+                writer.writerow([_csv_cell(hit.kind), _csv_cell(hit.path), _csv_cell(hit.origin), _csv_cell(hit.keywords),
                     _csv_cell(hit.match_source), hit.match_count,
                     _csv_cell("；".join(str(m.get("position", "")) for m in hit.matches)),
                     _csv_cell("\n\n".join(str(m.get("text", "")) for m in hit.matches)),
-                    hit.size, _timestamp(hit.modified), _csv_cell(hit.content_error)])
+                    hit.size, _timestamp(hit.modified), _csv_cell(hit.content_error),
+                    _csv_cell("；".join(line for line in hit.detail.splitlines() if line.startswith(("原路径：", "删除时间："))))])
     elif suffix == ".txt":
         summary = _metadata_summary(metadata, hits)
         with open(path, "w", encoding="utf-8") as stream:
@@ -163,7 +181,10 @@ def export_report(path, hits, metadata):
             stream.write("关键词：" + "、".join(metadata.get("keywords", [])) + "\n\n")
             for index, hit in enumerate(hits, 1):
                 stream.write(f"{index}. [{hit.kind}] {hit.path}\n")
-                stream.write(f"   关键词：{hit.keywords}  ·  来源：{hit.match_source or '名称'}  ·  内容 {hit.match_count} 处\n")
+                stream.write(f"   位置：{hit.origin}  ·  关键词：{hit.keywords}  ·  命中：{hit.match_source or '名称'}  ·  内容 {hit.match_count} 处\n")
+                for line in hit.detail.splitlines():
+                    if line.startswith(("原路径：", "删除时间：")):
+                        stream.write("   " + line + "\n")
                 for entry in hit.matches:
                     stream.write(f"   {entry.get('position', '')}\n   {entry.get('text', '')}\n")
                 if hit.content_error:
