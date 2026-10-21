@@ -54,9 +54,9 @@ class ExtraSourceTests(unittest.TestCase):
                 "[Trash Info]\nPath=/home/test/My%20Notes/notes.txt\nDeletionDate=2026-10-21T11:30:00\n",
                 encoding="utf-8")
             roots = discover_extra_roots("Linux", home, {"TMPDIR": str(home / "missing")})
-            self.assertIn((str(cache), "用户缓存"), roots)
-            self.assertIn((str(config), "用户配置"), roots)
-            self.assertIn((str(trash / "files"), "回收站"), roots)
+            self.assertIn((str(cache.resolve()), "用户缓存"), roots)
+            self.assertIn((str(config.resolve()), "用户配置"), roots)
+            self.assertIn((str((trash / "files").resolve()), "回收站"), roots)
             self.assertEqual(trash_metadata(item, home),
                              ("/home/test/My Notes/notes.txt", "2026-10-21T11:30:00"))
 
