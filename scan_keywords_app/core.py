@@ -118,6 +118,9 @@ class Hit:
     content_error: str = ""
     matched_keywords: list = field(default_factory=list)
     origin: str = "普通文件"
+    registry_kind: str = ""
+    registry_key: str = ""
+    registry_value: str = ""
 
 
 def fingerprint(info):
@@ -405,11 +408,13 @@ class Scanner:
                 source = ("注册表名称+数据" if name_match and data_match else
                           "注册表数据" if data_match else "注册表路径" if entry.kind == "key" else "注册表值名")
                 path = entry.key_path if entry.kind == "key" else self.current
-                self.emit_hit(Hit(path, "注册表", " | ".join(matched), detail=f"只读注册表结果 · {source}",
+                self.emit_hit(Hit(path, "注册表", " | ".join(matched), detail=f"{'注册表键' if entry.kind == 'key' else '注册表值'} · {source}",
                                   match_source=source, location=result["location"], snippet=result["snippet"],
                                   matches=result["matches"], match_count=result["match_count"],
                                   matches_limited=result["matches_limited"], matched_keywords=matched,
-                                  origin=classify_registry_path(path)))
+                                  origin=classify_registry_path(path),
+                                  registry_kind="key" if entry.kind == "key" else "value",
+                                  registry_key=entry.key_path, registry_value=entry.name if entry.kind != "key" else ""))
             self.progress()
 
     def scan_programs(self):

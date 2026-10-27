@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -23,6 +24,7 @@ from .ocr import available_engine
 from .widgets import Choice, Toggle, MatchPreview, ActionMenu, ResultSplit
 from .permissions import is_windows_admin, request_elevation
 from .system_files import describe_failure, is_user_cancelled
+from . import registry_actions
 from .core import (FileActions, Scanner, data_dir, default_excludes,
                    export_report, local_roots, normalize_keywords, save_json, compact_paths, canonical)
 
@@ -54,6 +56,7 @@ class App:
         self.operating = False
         self.closing = False
         self.results = {}
+        self.visible_count = 0
         self.next_id = 0
         self.metadata = {}
         self.error_samples = []
@@ -134,7 +137,9 @@ class App:
                 "ocr_images": self.ocr_images.get(),
                 "sidebar_collapsed": self.sidebar_collapsed, "scan_mode": SCAN_MODES[self.scan_mode.get()],
                 "content_types": self.content_types, "max_content_mb": self.content_limit.get(),
-                "preview_visible": self.preview_visible, "preview_ratio": self.preview_ratio})
+                "preview_visible": self.preview_visible, "preview_ratio": self.preview_ratio,
+                "result_column_widths": {column: self.tree.column(column, "width") / self.display_scale
+                                         for column in self.tree["columns"]}})
             return True
         except OSError as exc:
             messagebox.showwarning("设置未保存", str(exc), parent=self.root)
@@ -320,7 +325,7 @@ class App:
             row=5, column=0, sticky="ew", pady=(s(4), 0))
         self.scan_registry = tk.BooleanVar(value=False)
         if os.name == "nt":
-            Toggle(scopes, text="Windows 注册表（只读文字）", variable=self.scan_registry, width=1).grid(
+            Toggle(scopes, text="Windows 注册表（键名与值）", variable=self.scan_registry, width=1).grid(
                 row=6, column=0, sticky="ew", pady=(s(4), 0))
         self.ocr_images = tk.BooleanVar(value=False)
         self.ocr_toggle = Toggle(scopes, text="图片文字识别 OCR（可选）", variable=self.ocr_images, width=1)
@@ -437,7 +442,15 @@ class App:
         self.origin_choice.grid(row=0, column=3, sticky="w")
         self.export_filtered = tk.BooleanVar(value=False)
         Toggle(extra_filters, text="报告仅含当前筛选", variable=self.export_filtered, width=21).grid(row=0, column=4, sticky="e")
+        exclude_row = ttk.Frame(filters, style="Card.TFrame")
+        exclude_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(s(8), 0))
+        exclude_row.columnconfigure(1, weight=1)
+        ttk.Label(exclude_row, text="排除词", style="Muted.TLabel").grid(row=0, column=0, padx=(0, s(10)))
+        self.exclude_query = tk.StringVar(value="")
+        ttk.Entry(exclude_row, textvariable=self.exclude_query, width=1).grid(row=0, column=1, sticky="ew")
+        ttk.Label(exclude_row, text="多个词用逗号分隔，任一命中即隐藏", style="Muted.TLabel").grid(row=0, column=2, padx=(s(8), 0))
         self.query.trace_add("write", self.schedule_filter)
+        self.exclude_query.trace_add("write", self.schedule_filter)
         self.keyword_filter.trace_add("write", self.schedule_filter)
         self.kind.trace_add("write", self.schedule_filter)
         self.file_category.trace_add("write", self.schedule_filter)
@@ -451,11 +464,22 @@ class App:
         table.grid_propagate(False)
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
-        columns = ("kind", "path", "origin", "keywords", "match_source", "size", "modified")
+        columns = ("number", "kind", "path", "origin", "keywords", "match_source", "size", "modified")
         self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="extended")
-        for column, caption, width in zip(columns, ("类型", "完整路径 / 程序名", "位置来源", "命中关键词", "命中来源", "大小", "修改时间"), (68, 310, 115, 130, 90, 85, 145)):
-            self.tree.heading(column, text=caption, anchor="w", command=lambda c=column: self.sort(c))
-            self.tree.column(column, width=s(width), minwidth=s(220 if column == "path" else 45), stretch=column == "path", anchor="w")
+        saved_widths = self.config.get("result_column_widths", {})
+        if not isinstance(saved_widths, dict):
+            saved_widths = {}
+        for column, caption, width in zip(columns, ("行号", "类型", "完整路径 / 程序名", "位置来源", "命中关键词", "命中来源", "大小", "修改时间"), (65, 68, 310, 115, 130, 90, 85, 145)):
+            self.tree.heading(column, text=caption, anchor="w")
+            if column != "number":
+                self.tree.heading(column, command=lambda c=column: self.sort(c))
+            stored = saved_widths.get(column, width)
+            if isinstance(stored, (float, int)) and 45 <= stored <= 4000:
+                width = stored
+            # Fixed column widths keep Tk's layout pass from undoing a drag.
+            # The horizontal scrollbar handles content wider than the window.
+            self.tree.column(column, width=s(width), minwidth=s(45), stretch=False,
+                             anchor="e" if column == "number" else "w")
         ys = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -466,7 +490,7 @@ class App:
         self.results_split.add_bottom(self.preview)
         self.preview.grid_propagate(False)
         self.tree.bind("<<TreeviewSelect>>", self.selection_changed)
-        self.tree.bind("<Double-1>", lambda _e: self.open_result())
+        self.tree.bind("<Double-1>", self.result_double_click)
         self.tree.bind("<Button-3>", self.context_menu)
         self.tree.bind("<Control-a>", self.select_all)
         self.tree.bind("<Command-a>", self.select_all)
@@ -736,10 +760,7 @@ class App:
         self.stop_button.configure(state="normal" if self.scanner else "disabled")
         self.export_button.configure(state="disabled" if running else "normal")
         selected = self.selected_hits()
-        can_change_files = not running and bool(selected) and all(
-            hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in selected)
-        for button in self.file_buttons[2:]:
-            button.configure(state="normal" if can_change_files else "disabled")
+        self.update_action_buttons(selected, running=running)
         self.mode_choice.set_enabled(not running)
         self.detect_button.configure(state="disabled" if running else "normal")
         self.target_button.configure(state="disabled" if running else "normal")
@@ -795,6 +816,7 @@ class App:
         self.save_config()
         self.cancel_rebuild()
         self.tree.delete(*self.tree.get_children())
+        self.visible_count = 0
         self.results.clear()
         self.keyword_choice.set_values(("全部关键词", *keywords))
         self.origin_choice.set_values(tuple(dict.fromkeys(("全部位置", "普通文件",
@@ -857,6 +879,14 @@ class App:
 
     def visible(self, hit):
         query = self.query.get().casefold().strip()
+        exclude_query = self.exclude_query.get().strip()
+        searchable = ""
+        if query or exclude_query:
+            excluded = normalize_keywords(re.split(r"[,，;；\n]+", exclude_query))
+            searchable = " ".join((hit.path, hit.keywords, hit.detail, hit.location, hit.snippet,
+                                   *(str(match.get("text", "")) for match in hit.matches))).casefold()
+            if any(word.casefold() in searchable for word in excluded):
+                return False
         keyword = self.keyword_filter.get()
         matched_words = hit.matched_keywords or hit.keywords.split(" | ")
         source = self.source_filter.get()
@@ -869,10 +899,11 @@ class App:
                 "内容", "名称+内容", "注册表数据", "注册表名称+数据", "图片OCR", "名称+OCR") or
             source == "仅名称命中" and hit.match_source not in (
                 "内容", "名称+内容", "注册表数据", "注册表名称+数据", "图片OCR", "名称+OCR")) and (
-            not query or query in (hit.path + " " + hit.keywords + " " + hit.detail).casefold())
+            not query or query in searchable)
 
     def reset_filters(self):
         self.query.set("")
+        self.exclude_query.set("")
         self.keyword_filter.set("全部关键词")
         self.kind.set("全部类型")
         self.file_category.set("全部文件类别")
@@ -886,7 +917,8 @@ class App:
         return "break"
 
     def insert_hit(self, key, hit):
-        self.tree.insert("", "end", iid=key, values=(hit.kind, hit.path, hit.origin, hit.keywords,
+        self.visible_count += 1
+        self.tree.insert("", "end", iid=key, values=(self.visible_count, hit.kind, hit.path, hit.origin, hit.keywords,
             hit.match_source or ("程序名称" if hit.kind == "程序" else "文件名"),
             size_text(hit.size) if hit.kind == "文件" else "—",
             datetime.fromtimestamp(hit.modified).strftime("%Y-%m-%d %H:%M") if hit.modified else "—"))
@@ -900,10 +932,18 @@ class App:
         self.selected_path.set(hits[0].path if hits else "")
         self.selected_path_entry.xview_moveto(0)
         self.preview.set_hit(hits[0] if hits else None, selected=len(hits))
-        can_change_files = bool(hits) and all(
-            hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in hits) and not self.busy
-        for button in self.file_buttons[2:]:
-            button.configure(state="normal" if can_change_files else "disabled")
+        self.update_action_buttons(hits)
+
+    def update_action_buttons(self, hits, *, running=None):
+        idle = not (self.busy if running is None else running)
+        files = bool(hits) and all(hit.kind in ("文件", "目录") and hit.origin != "回收站" for hit in hits)
+        registry = bool(hits) and all(hit.kind == "注册表" and hit.registry_kind in ("key", "value") for hit in hits)
+        self.file_buttons[2].configure(state="normal" if idle and files else "disabled")
+        self.file_buttons[3].configure(state="normal" if idle and (files or registry) else "disabled")
+
+    def result_double_click(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell":
+            self.open_result()
 
     def view_paths(self):
         hits = self.selected_hits()
@@ -966,12 +1006,35 @@ class App:
             self.root.after_cancel(self.filter_timer)
             self.filter_timer = None
 
-    def rebuild(self, selection_paths=None):
+    def capture_result_view(self):
+        rows = self.tree.get_children()
+        top = min(int(round(self.tree.yview()[0] * len(rows))), max(0, len(rows) - 1))
+        return rows, top, self.tree.xview()[0], self.tree.focus()
+
+    def restore_result_view(self, view):
+        old_rows, top, horizontal, focus = view
+        rows = self.tree.get_children()
+        if not rows:
+            return
+        positions = {key: index for index, key in enumerate(rows)}
+        anchor = next((key for key in old_rows[top:] if key in positions), None)
+        if anchor is None:
+            anchor = next((key for key in reversed(old_rows[:top]) if key in positions), rows[0])
+        # Let Tk recalculate the item count before restoring a distant row.
+        self.tree.update_idletasks()
+        self.tree.yview_moveto(positions[anchor] / len(rows))
+        self.tree.xview_moveto(horizontal)
+        if focus in positions:
+            self.tree.focus(focus)
+
+    def rebuild(self, selection_paths=None, *, preserve_view=False):
+        view = self.capture_result_view() if preserve_view else None
         self.cancel_rebuild()
         generation = self.rebuild_generation
         selected = set(self.tree.selection()) if selection_paths is None else {
             key for key, hit in self.results.items() if hit.path in selection_paths}
         self.tree.delete(*self.tree.get_children())
+        self.visible_count = 0
         items = [(key, hit) for key, hit in self.results.items() if self.visible(hit)]
         items.sort(key=lambda pair: getattr(pair[1], self.sort_column), reverse=self.sort_reverse)
         def chunk(offset=0):
@@ -987,6 +1050,8 @@ class App:
                 self.rebuild_id = self.root.after(1, lambda: chunk(offset+400))
             else:
                 self.rebuild_id = None
+                if view:
+                    self.restore_result_view(view)
                 self.selection_changed()
         chunk()
 
@@ -1081,6 +1146,8 @@ class App:
                            ("⌫  移入系统回收站", lambda: self.operate("delete"), True)])
             if os.name != "nt":
                 groups[-1].append(("✕  彻底删除（需确认）", lambda: self.operate("delete", permanent=True), True))
+        elif hits and all(hit.kind == "注册表" and hit.registry_kind in ("key", "value") for hit in hits):
+            groups.append([("⌫  删除选中的注册表键 / 值", lambda: self.operate("delete"), True)])
         if self.actions.bin.is_dir():
             groups.append([("↶  恢复旧版文件", self.recovery, False)])
         self.menu.show(event.x_root, event.y_root, groups)
@@ -1100,7 +1167,7 @@ class App:
         hit = hits[0]
         if hit.kind == "注册表":
             self.copy_paths()
-            messagebox.showinfo("注册表位置已复制", "这是只读结果。请在 Windows 注册表编辑器中按复制的位置查找。", parent=self.root)
+            messagebox.showinfo("注册表位置已复制", "请在 Windows 注册表编辑器中按复制的位置查找。删除可在结果列表中操作。", parent=self.root)
             return
         if hit.kind == "程序" and not Path(hit.path).is_absolute():
             messagebox.showinfo("程序清单", "此项来自系统已安装程序列表，没有可打开的目录。", parent=self.root)
@@ -1204,8 +1271,14 @@ class App:
         if not hits:
             messagebox.showinfo("选择文件", "请先选中需要操作的文件或目录。", parent=self.root)
             return
+        if any(hit.kind == "注册表" for hit in hits):
+            if mode == "delete" and all(hit.kind == "注册表" for hit in hits):
+                self.operate_registry(hits)
+            else:
+                messagebox.showinfo("请分别操作", "注册表结果只支持删除。请将注册表与文件结果分开选择。", parent=self.root)
+            return
         if any(h.kind not in ("文件", "目录") or h.origin == "回收站" for h in hits):
-            messagebox.showinfo("包含只读结果", "请只选择普通文件或目录。注册表、程序及回收站结果只能查看和复制。", parent=self.root)
+            messagebox.showinfo("包含只读结果", "请只选择普通文件或目录。程序及回收站结果只能查看和复制。", parent=self.root)
             return
         hits = self.actions.selected(hits)
         destination = None
@@ -1263,6 +1336,67 @@ class App:
                 failed_paths=failed_paths, permanent=permanent, cancelled=cancelled, unprocessed=unprocessed)))
         threading.Thread(target=worker, daemon=True).start()
 
+    def operate_registry(self, hits):
+        try:
+            hits = registry_actions.selected(hits)
+        except ValueError as exc:
+            messagebox.showerror("无法删除注册表", str(exc), parent=self.root)
+            return
+        paths = [f"键及全部子项：{hit.registry_key}" if hit.registry_kind == "key" else
+                 f"值：{hit.registry_key} → {hit.registry_value or '(默认)'}" for hit in hits]
+        explanation = (f"将永久删除以下 {len(hits)} 个注册表目标，不经过系统回收站。\n"
+                       "删除值只移除该值；删除键包含其全部子键和值，包括未命中的内容。\n"
+                       "父键与子项同时选中时，只操作父键。权限不足的项会保留并报告失败。")
+        if not self.confirm_operation("删除注册表", explanation, paths, permanent=True):
+            return
+        self.operating = True
+        self.set_running(True)
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", value=0, maximum=len(hits))
+        self.status.set(f"正在删除注册表 0 / {len(hits)} 项，请等待…")
+
+        def worker():
+            successes, failures, failed_paths, removed_keys = [], [], [], []
+            for index, hit in enumerate(hits, 1):
+                try:
+                    registry_actions.delete(hit)
+                    successes.append((hit.path, ""))
+                    removed_keys.extend(key for key, item in self.results.items() if registry_actions.covers(hit, item))
+                except Exception as exc:
+                    failed_paths.append(hit.path)
+                    failures.append(describe_failure(hit.path, "删除注册表", exc))
+                self.events.put(("action_progress", dict(title="删除注册表", path=hit.path, done=index, total=len(hits))))
+            self.events.put(("operation_done", dict(mode="registry_delete", successes=successes, failures=failures,
+                failed_paths=failed_paths, removed_keys=removed_keys, permanent=True)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def remove_result_rows(self, keys):
+        """Remove completed targets without throwing away the current viewport."""
+        view = self.capture_result_view()
+        old_rows, _top, _horizontal, _focus = view
+        selection = self.tree.selection()
+        for key in keys:
+            self.results.pop(key, None)
+        if self.rebuild_id or self.filter_timer:
+            self.rebuild(preserve_view=True)
+            return
+        present = [key for key in keys if self.tree.exists(key)]
+        if present:
+            self.tree.delete(*present)
+        rows = self.tree.get_children()
+        self.visible_count = len(rows)
+        for number, key in enumerate(rows, 1):
+            self.tree.set(key, "number", number)
+        if rows and selection and not self.tree.selection():
+            selected_set = set(selection)
+            index = next((index for index, key in enumerate(old_rows) if key in selected_set), 0)
+            neighbor = rows[min(index, len(rows) - 1)]
+            self.tree.selection_set(neighbor)
+            self.tree.focus(neighbor)
+        self.restore_result_view(view)
+        self.selection_changed()
+
     def select_failed_paths(self, paths):
         self.reset_filters()
         self.rebuild(selection_paths=set(paths))
@@ -1272,10 +1406,10 @@ class App:
         self.operating = False
         successes, failures = payload["successes"], payload["failures"]
         if payload["mode"] != "restore":
-            for key, hit in list(self.results.items()):
-                if hit.kind in ("文件", "目录") and any(beneath(hit.path, src) for src, _target in successes):
-                    del self.results[key]
-            self.rebuild()
+            removed = payload.get("removed_keys", []) if payload["mode"] == "registry_delete" else [
+                key for key, hit in self.results.items() if hit.kind in ("文件", "目录") and
+                any(beneath(hit.path, src) for src, _target in successes)]
+            self.remove_result_rows(removed)
         self.action_log.append({"time": datetime.now().isoformat(" ", timespec="seconds"), **payload})
         self.set_running(False)
         state = "操作已取消" if payload.get("cancelled") else "操作结束"
@@ -1298,6 +1432,8 @@ class App:
             self.current.set("旧版文件已恢复到原路径。重新扫描可以刷新结果。")
         elif payload["mode"] == "move":
             self.current.set("文件移动已完成。")
+        elif payload["mode"] == "registry_delete":
+            self.current.set("注册表删除已完成。删除的键及值不进入系统回收站。")
         elif payload.get("permanent"):
             self.current.set("已按确认彻底删除。")
         else:

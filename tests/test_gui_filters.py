@@ -24,6 +24,7 @@ class GuiFilterTests(unittest.TestCase):
     def make_app(self):
         app = App.__new__(App)
         app.query = Variable("")
+        app.exclude_query = Variable("")
         app.keyword_filter = Variable("全部关键词")
         app.kind = Variable("全部类型")
         app.file_category = Variable("全部文件类别")
@@ -51,6 +52,28 @@ class GuiFilterTests(unittest.TestCase):
         app.source_filter.set("仅名称命中")
         self.assertFalse(app.visible(content))
         self.assertTrue(app.visible(filename))
+
+    def test_exclusion_matches_any_term_without_changing_results(self):
+        app = self.make_app()
+        app.exclude_query.set("cache，临时; OLD phrase\n")
+        examples = [Hit("/Cache/note.txt", "文件", "ORBIT"),
+                    Hit("/note.txt", "文件", "ORBIT", snippet="临时资料"),
+                    Hit("/note.txt", "文件", "ORBIT", matches=[{"text": "An old PHRASE here"}])]
+        for hit in examples:
+            self.assertFalse(app.visible(hit))
+        kept = Hit("/note.txt", "文件", "ORBIT")
+        self.assertTrue(app.visible(kept))
+        app.exclude_query.set("")
+        self.assertTrue(app.visible(examples[0]))
+        app.exclude_query.set("orbit")
+        app.keyword_filter.set("ORBIT")
+        self.assertFalse(app.visible(kept))
+
+    def test_reset_also_clears_result_exclusions(self):
+        app = self.make_app()
+        app.exclude_query.set("cache")
+        app.reset_filters()
+        self.assertEqual(app.exclude_query.get(), "")
 
     def test_location_filter_distinguishes_cache_and_registry(self):
         app = self.make_app()
